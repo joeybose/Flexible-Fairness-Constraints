@@ -83,7 +83,7 @@ def main():
     ''' Count attributes '''
     train_attr_count = count_attributes(train_data, attr_to_idx)
 
-    ''' Reindex Attribute Dictionary with 100 Most Common '''
+    ''' Reindex Attribute Dictionary with 50 Most Common '''
     train_reindex_attr_idx = reindex_attributes(train_attr_count.most_common(50))
 
     ipdb.set_trace()
@@ -91,7 +91,7 @@ def main():
     attribute_mat = transform_data(train_data, ent_to_idx, attr_to_idx,\
             train_reindex_attr_idx, attribute_mat)
 
-    pickle.dump(train_set, open('./data/Attributes_%s-train.pkl' % args.dataset, 'wb'), protocol=-1)
+    pickle.dump(attribute_mat, open('./data/Attributes_%s-train.pkl' % args.dataset, 'wb'), protocol=-1)
 
     json.dump(ent_to_idx, open('./data/Attributes_%s-ent_to_idx.json' % args.dataset, 'w'))
     json.dump(attr_to_idx, open('./data/Attributes_%s-attr_to_idx.json' % args.dataset, 'w'))
