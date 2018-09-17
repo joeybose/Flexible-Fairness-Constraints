@@ -1,0 +1,5 @@
+./trans_e.py
+./trans_d.py
+./data/*
+./fb15k/*
+./knowledge_graph/*
