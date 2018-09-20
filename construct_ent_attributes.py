@@ -86,7 +86,6 @@ def main():
     ''' Reindex Attribute Dictionary with 50 Most Common '''
     train_reindex_attr_idx = reindex_attributes(train_attr_count.most_common(50))
 
-    ipdb.set_trace()
     attribute_mat = np.zeros((len(ent_to_idx),50))
     attribute_mat = transform_data(train_data, ent_to_idx, attr_to_idx,\
             train_reindex_attr_idx, attribute_mat)
@@ -95,13 +94,11 @@ def main():
 
     json.dump(ent_to_idx, open('./data/Attributes_%s-ent_to_idx.json' % args.dataset, 'w'))
     json.dump(attr_to_idx, open('./data/Attributes_%s-attr_to_idx.json' % args.dataset, 'w'))
+    json.dump(train_reindex_attr_idx, open('./data/Attributes_%s-reindex_attr_to_idx.json' % args.dataset, 'w'))
 
     print("Dataset: %s" % args.dataset)
     print("# entities: %s; # Attributes: %s" % (len(ent_to_idx),
                                                len(attr_to_idx)))
-    print("train set size: %s; valid set size: %s; test set size: %s" % (len(train_set),
-                                                                         len(valid_set),
-                                                                         len(test_set)))
 
 if __name__ == '__main__':
     main()

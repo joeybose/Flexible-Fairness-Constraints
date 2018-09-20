@@ -12,7 +12,7 @@ if __name__ == '__main__':
     parser.add_argument('--save_dir', type=str, default='./results/', help="output path")
     parser.add_argument('--dataset', type=str, default='FB15k', help='Knowledge base version (default: FB15k)')
     args = parser.parse_args()
-    outname_base = os.path.join(args.save_dir, 'Paper_{}'.format(args.dataset))
+    outname_base = os.path.join(args.save_dir, 'FairD_[15]_{}'.format(args.dataset))
     epochs = np.arange(20,1000,20)
 
     mrr_list = []
@@ -54,5 +54,5 @@ if __name__ == '__main__':
     ax2.plot(epochs, h10_list, label='H10')
     ax1.set_xlabel('Epochs')
     f.legend()
-    f.savefig('Paper_TransD_FB15k_NCE_plot.jpg')
+    f.savefig('FairD_[15]_TransD_FB15k_NCE_plot.jpg')
 
