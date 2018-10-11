@@ -5,12 +5,14 @@ An implementation of TransE model in PyTorch
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import shutil
 import torch.optim as optim
 from torch.autograd import Variable
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.init import xavier_normal, xavier_uniform
 from torch.distributions import Categorical
 from tensorboard_logger import Logger as tfLogger
+from sklearn.metrics import precision_recall_fscore_support
 import numpy as np
 import random
 import argparse
@@ -22,6 +24,7 @@ import subprocess
 from tqdm import tqdm
 from utils import create_or_append, compute_rank
 import joblib
+from collections import Counter
 import ipdb
 sys.path.append('../')
 import gc
@@ -99,7 +102,6 @@ class TransD(nn.Module):
         return proj_es
 
     def forward(self, triplets, return_ent_emb=False):
-
         lhs_idxs = triplets[:, 0]
         rel_idxs = triplets[:, 1]
         rhs_idxs = triplets[:, 2]
@@ -116,6 +118,10 @@ class TransD(nn.Module):
             enrgs = (lhs + rel_es - rhs).norm(p=self.p, dim=1)
             return enrgs,lhs,rhs
 
+    def get_embed(self, ents, rel_idxs):
+        ent_embed = self.ent_embeds(ents, rel_idxs)
+        return ent_embed
+
     def save(self, fn):
         torch.save(self.state_dict(), fn)
 
@@ -123,18 +129,21 @@ class TransD(nn.Module):
         self.load_state_dict(torch.load(fn))
 
 class DemParDisc(nn.Module):
-    def __init__(self, embed_dim, a_idx, attribute_data=None):
+    def __init__(self, embed_dim, a_idx, attribute_data=None,\
+            use_cross_entropy=True):
         super(DemParDisc, self).__init__()
         self.embed_dim = int(embed_dim)
         self.a_idx = a_idx
-        r = 6 / np.sqrt(self.embed_dim)
-        self.W1 = nn.Linear(self.embed_dim, int(self.embed_dim / 2), bias=True)
-        self.W2 = nn.Linear(int(self.embed_dim / 2), int(self.embed_dim / 4), bias=True)
-        self.W3 = nn.Linear(int(self.embed_dim / 4), 1, bias=True)
-
-        self.W1.weight.data.uniform_(-r, r)
-        self.W2.weight.data.uniform_(-r, r)
-        self.W3.weight.data.uniform_(-r, r)
+        if use_cross_entropy:
+            self.cross_entropy = True
+            self.out_dim = 1
+        else:
+            self.cross_entropy = False
+            self.out_dim = 1
+        self.W1 = nn.Linear(self.embed_dim, int(self.embed_dim * 2), bias=True)
+        self.W2 = nn.Linear(int(self.embed_dim * 2), int(self.embed_dim), bias=True)
+        self.W3 = nn.Linear(int(self.embed_dim), int(self.embed_dim / 2), bias=True)
+        self.W4 = nn.Linear(int(self.embed_dim / 2), self.out_dim, bias=True)
 
         if attribute_data is not None:
             self.attr_mat = np.array(pickle.load(open(attribute_data[0],'rb')))
@@ -147,15 +156,45 @@ class DemParDisc(nn.Module):
             with open(attribute_data[3]) as f:
                 self.reindex_to_idx = json.load(f)
             f.close()
+            with open(attribute_data[4]) as f:
+                self.attr_count = Counter(json.load(f))
+            f.close()
             self.inv_attr_map = {v: k for k, v in self.attr_to_idx.items()}
+            self.most_common = self.attr_count.most_common(50)
+            self.sensitive_weight = 1-float(self.most_common[a_idx[0]][1]) / sum(self.attr_count.values())
+            self.weights = torch.Tensor((1-self.sensitive_weight,self.sensitive_weight)).cuda()
 
     def forward(self, ents_emb, ents):
         h1 = F.leaky_relu(self.W1(ents_emb))
         h2 = F.leaky_relu(self.W2(h1))
-        probs = torch.sigmoid(self.W3(h2))
+        h3 = F.leaky_relu(self.W3(h2))
+        scores = self.W4(h3)
         A_labels = Variable(torch.Tensor(self.attr_mat[ents][:,self.a_idx])).cuda()
-        fair_penalty = F.l1_loss(probs,A_labels,reduction='elementwise_mean')
+        if self.cross_entropy:
+            fair_penalty = F.binary_cross_entropy_with_logits(scores,\
+                    A_labels,weight=self.weights)
+        else:
+            probs = torch.sigmoid(scores)
+            fair_penalty = F.l1_loss(probs,A_labels,reduction='elementwise_mean')
         return fair_penalty
+
+    def predict(self, ents_emb, ents, return_preds=False):
+        h1 = F.leaky_relu(self.W1(ents_emb))
+        h2 = F.leaky_relu(self.W2(h1))
+        h3 = F.leaky_relu(self.W3(h2))
+        scores = self.W4(h3)
+        A_labels = Variable(torch.Tensor(self.attr_mat[ents][:,self.a_idx])).cuda()
+        # if self.cross_entropy:
+            # probs = F.binary_cross_entropy_with_logits(scores,A_labels,reduction='none')
+            # preds = (probs > torch.Tensor([0.5]).cuda()).float() * 1
+        # else:
+        probs = torch.sigmoid(scores)
+        preds = (probs > torch.Tensor([0.5]).cuda()).float() * 1
+        correct = preds.eq(A_labels.view_as(preds)).sum().item()
+        if return_preds:
+            return preds, A_labels
+        else:
+            return correct
 
     def save(self, fn):
         torch.save(self.state_dict(), fn)
@@ -254,6 +293,9 @@ def parse_args():
     parser.add_argument('--dataset', type=str, default='FB15k', help='Knowledge base version (default: WN)')
     parser.add_argument('--save_dir', type=str, default='./results/', help="output path")
     parser.add_argument('--do_log', action='store_true', help="whether to log to csv")
+    parser.add_argument('--load_transD', action='store_true', help="Load TransD")
+    parser.add_argument('--freeze_transD', action='store_true', help="Load TransD")
+    parser.add_argument('--use_cross_entropy', action='store_true', help="DemPar Discriminators Loss as CE")
     parser.add_argument('--remove_old_run', action='store_true', help="remove old run")
     parser.add_argument('--data_dir', type=str, default='./data/', help="Contains Pickle files")
     parser.add_argument('--num_epochs', type=int, default=1000, help='Number of training epochs (default: 500)')
@@ -262,6 +304,7 @@ def parse_args():
     parser.add_argument('--print_freq', type=int, default=5, help='Print frequency in epochs (default: 5)')
     parser.add_argument('--embed_dim', type=int, default=50, help='Embedding dimension (default: 50)')
     parser.add_argument('--z_dim', type=int, default=100, help='noise Embedding dimension (default: 100)')
+    parser.add_argument('--gamma', type=int, default=0.1, help='Tradeoff for Adversarial Penalty')
     parser.add_argument('--lr', type=float, default=0.008, help='Learning rate (default: 0.001)')
     parser.add_argument('--margin', type=float, default=3, help='Loss margin (default: 1)')
     parser.add_argument('--p', type=int, default=1, help='P value for p-norm (default: 1)')
@@ -301,26 +344,23 @@ def parse_args():
                 'Attributes_FB15k-attr_to_idx.json')
         args.reindex_attr_idx = os.path.join(args.data_dir,\
                 'Attributes_FB15k-reindex_attr_to_idx.json')
+        args.attr_count = os.path.join(args.data_dir,\
+                'Attributes_FB15k-attr_count.json')
     else:
         args.attr_mat = None
         args.ent_to_idx = None
         args.attr_to_idx = None
         args.reindex_attr_idx = None
-
-    args.fair_att = np.random.choice(50,1) # Pick a random sensitive attribute
+    args.saved_path = os.path.join(args.save_dir,'Updated_Paper_FB15kD_final.pts')
+    args.fair_att = np.random.choice(1,1) # Pick a random sensitive attribute
     print("Sensitive attribute is %d" % (args.fair_att))
     args.outname_base = os.path.join(args.save_dir,\
-            'FairD_{}_{}'.format(str(args.fair_att),args.dataset))
+            args.namestr+'_FairD_{}_{}'.format(str(args.fair_att),args.dataset))
 
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
-
-    logging.info('========= Configuration =============')
-
-    logging.info('=====================================')
-    logging.info(args)
 
     ##############################################################
 
@@ -379,7 +419,12 @@ def lr_scheduler(optimizer, decay_lr, num_epochs):
         raise NotImplementedError()
 
     return scheduler
-###@profile
+
+def freeze_model(model):
+    model.eval()
+    for params in model.parameters():
+        params.requires_grad = False
+
 def main(args):
     if args.dataset in ('FB15k-237', 'kinship', 'nations', 'umls', 'WN18RR', 'YAGO3-10'):
         S = joblib.load(args.data_path)
@@ -408,13 +453,17 @@ def main(args):
     tflogger = tfLogger(logdir)
     modelD = TransD(args.num_ent, args.num_rel, args.embed_dim, args.p)
 
+    if args.load_transD:
+        modelD.load(args.saved_path)
+
     if args.use_cuda:
         modelD.cuda()
 
     if args.use_attr:
         ''' Hard Coded to the most common attribute for now '''
-        attr_data = [args.attr_mat,args.ent_to_idx,args.attr_to_idx,args.reindex_attr_idx]
-        fairD = DemParDisc(args.embed_dim,args.fair_att,attr_data)
+        attr_data = [args.attr_mat,args.ent_to_idx,args.attr_to_idx,\
+                args.reindex_attr_idx,args.attr_count]
+        fairD = DemParDisc(args.embed_dim,args.fair_att,attr_data,args.use_cross_entropy)
         fairD.cuda()
         most_common_attr = [print(fairD.inv_attr_map[int(k)]) for k in \
                 fairD.reindex_to_idx.keys()]
@@ -438,6 +487,11 @@ def main(args):
 
         lossesD = []
         monitor_grads = []
+        precision_list = []
+        recall_list = []
+        fscore_list = []
+        correct = 0
+        total_ent = 0
         if args.show_tqdm:
             data_itr = tqdm(enumerate(data_loader))
         else:
@@ -470,14 +524,17 @@ def main(args):
 
             if args.ace == 0:
                 d_ins = torch.cat([p_batch_var, nce_batch], dim=0).contiguous()
-                if args.use_attr:
+                if args.use_attr and not args.freeze_transD:
                     d_outs,lhs_emb,rhs_emb = modelD(d_ins,True)
                     with torch.no_grad():
                         p_lhs_emb = lhs_emb[:len(p_batch_var)]
                         p_rhs_emb = rhs_emb[:len(p_batch_var)]
                         l_penalty = fairD(p_lhs_emb,p_batch[:,0])
                         r_penalty = fairD(p_rhs_emb,p_batch[:,2])
-                        fair_penalty = 1 - 0.5*(l_penalty + r_penalty)
+                        if not args.use_cross_entropy:
+                            fair_penalty = 1 - 0.5*(l_penalty + r_penalty)
+                        else:
+                            fair_penalty = l_penalty + r_penalty
                 else:
                     d_outs = modelD(d_ins)
                     fair_penalty = Variable(torch.zeros(1)).cuda()
@@ -485,11 +542,11 @@ def main(args):
                 p_enrgs = d_outs[:len(p_batch_var)]
                 nce_enrgs = d_outs[len(p_batch_var):(len(p_batch_var)+len(nce_batch))]
                 nce_term, nce_term_scores  = loss_func(p_enrgs, nce_enrgs, weights=(1.-nce_falseNs))
-                lossD = args.D_nce_weight*nce_term + fair_penalty
-                create_or_append(D_monitor, 'D_nce_loss', nce_term, v2np)
+                lossD = args.D_nce_weight*nce_term + args.gamma*fair_penalty
 
-            lossD.backward()
-            optimizerD.step()
+            if not args.freeze_transD:
+                lossD.backward()
+                optimizerD.step()
 
             if args.use_attr:
                 optimizer_fairD.zero_grad()
@@ -499,10 +556,44 @@ def main(args):
                     p_rhs_emb = rhs_emb[:len(p_batch)]
                 l_loss = fairD(p_lhs_emb,p_batch[:,0])
                 r_loss = fairD(p_rhs_emb,p_batch[:,2])
-                fairD_loss = 1 - 0.5*(l_loss + r_loss)
-                fairD_loss = -1*fairD_loss
+                fairD_loss = 0.5*(l_loss + r_loss)
+                if not args.use_cross_entropy:
+                    fairD_loss = -1*(1 - fairD_loss)
+                else:
+                    fairD_loss = fairD_loss
+                # fairD_loss = -1*fairD_loss
                 fairD_loss.backward()
                 optimizer_fairD.step()
+                l_preds,l_A_labels = fairD.predict(p_lhs_emb,p_batch[:,0],return_preds=True)
+                r_preds, r_A_labels = fairD.predict(p_rhs_emb,p_batch[:,2],return_preds=True)
+                l_correct = l_preds.eq(l_A_labels.view_as(l_preds)).sum().item()
+                r_correct = r_preds.eq(r_A_labels.view_as(r_preds)).sum().item()
+                correct += l_correct + r_correct
+                total_ent += 2*len(p_batch)
+                l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
+                        average='binary')
+                r_precision,r_recall,r_fscore,_ = precision_recall_fscore_support(r_A_labels, r_preds,\
+                        average='binary')
+                precision = (l_precision + r_precision) / 2
+                recall = (l_recall + r_recall) / 2
+                fscore = (l_fscore + r_fscore) / 2
+                precision_list.append(precision)
+                recall_list.append(recall)
+                fscore_list.append(fscore)
+
+        if args.do_log and args.use_attr: # Tensorboard logging
+            acc = 100. * correct / total_ent
+            mean_precision = np.mean(np.asarray(precision_list))
+            mean_recall = np.mean(np.asarray(recall_list))
+            mean_fscore = np.mean(np.asarray(fscore_list))
+            tflogger.scalar_summary('Train Fairness Discriminator,\
+                    Accuracy',float(acc),counter)
+            tflogger.scalar_summary('Train Fairness Discriminator,\
+                    Precision',float(mean_precision),counter)
+            tflogger.scalar_summary('Train Fairness Discriminator,\
+                    Recall',float(mean_recall),counter)
+            tflogger.scalar_summary('Train Fairness Discriminator,\
+                    F-score',float(mean_fscore),counter)
 
         ''' Logging for end of epoch '''
         fairD_grad_norm = monitor_grad_norm(fairD)
@@ -515,6 +606,57 @@ def main(args):
                       float(fairD_grad_norm), counter)
             tflogger.scalar_summary('Norm of FairD weights',\
                       float(fairD_weight_norm), counter)
+
+
+    def test_fairness(dataset):
+        test_loader = DataLoader(dataset, num_workers=1, batch_size=4096, collate_fn=collate_fn)
+        correct = 0
+        total_ent = 0
+        precision_list = []
+        recall_list = []
+        fscore_list = []
+        if args.show_tqdm:
+            data_itr = tqdm(enumerate(test_loader))
+        else:
+            data_itr = enumerate(test_loader)
+
+        for idx, triplet in data_itr:
+            lhs, rel, rhs = triplet[:,0], triplet[:,1],triplet[:,2]
+            l_batch = Variable(lhs).cuda()
+            r_batch = Variable(rhs).cuda()
+            rel_batch = Variable(rel).cuda()
+            lhs_emb = modelD.get_embed(l_batch,rel_batch)
+            rhs_emb = modelD.get_embed(r_batch,rel_batch)
+            l_preds,l_A_labels = fairD.predict(lhs_emb,lhs,return_preds=True)
+            r_preds, r_A_labels = fairD.predict(rhs_emb,rhs,return_preds=True)
+            l_correct = l_preds.eq(l_A_labels.view_as(l_preds)).sum().item()
+            r_correct = r_preds.eq(r_A_labels.view_as(r_preds)).sum().item()
+            l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
+                    average='binary')
+            r_precision,r_recall,r_fscore,_ = precision_recall_fscore_support(r_A_labels, r_preds,\
+                    average='binary')
+            precision = (l_precision + r_precision) / 2
+            recall = (l_recall + r_recall) / 2
+            fscore = (l_fscore + r_fscore) / 2
+            precision_list.append(precision)
+            recall_list.append(recall)
+            fscore_list.append(fscore)
+            correct += l_correct + r_correct
+            total_ent += len(lhs_emb) + len(rhs_emb)
+
+        if args.do_log and args.use_attr: # Tensorboard logging
+            acc = 100. * correct / total_ent
+            mean_precision = np.mean(np.asarray(precision_list))
+            mean_recall = np.mean(np.asarray(recall_list))
+            mean_fscore = np.mean(np.asarray(fscore_list))
+            tflogger.scalar_summary('Valid Fairness Discriminator,\
+                    Accuracy',float(acc),epoch)
+            tflogger.scalar_summary('Valid Fairness Discriminator,\
+                    Precision',float(mean_precision),epoch)
+            tflogger.scalar_summary('Valid Fairness Discriminator,\
+                    Recall',float(mean_recall),epoch)
+            tflogger.scalar_summary('Valid Fairness Discriminator,\
+                    F-score',float(mean_fscore),epoch)
 
     def test(dataset, subsample=1):
         l_ranks, r_ranks = [], []
@@ -571,28 +713,23 @@ def main(args):
     else:
         train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, drop_last=True,
                                   num_workers=4, pin_memory=True, collate_fn=collate_fn)
+
+    if args.freeze_transD:
+        freeze_model(modelD)
+
     for epoch in tqdm(range(1, args.num_epochs + 1)):
         train(train_loader,epoch)
         gc.collect()
-        if epoch % args.print_freq == 0:
-
-            logging.info("~~~~~~ Epoch {} ~~~~~~".format(epoch))
-            for k in D_monitor:
-                if k.endswith('_epoch_avg'):
-                    logging.info("{:<30} {:10.5f}".format(k, D_monitor[k][-1]))
-
-            logging.info("****")
-
         if args.decay_lr:
             if args.decay_lr == 'ReduceLROnPlateau':
                 schedulerD.step(monitor['D_loss_epoch_avg'])
             else:
                 schedulerD.step()
+                # scheduler_fairD.step()
 
         if epoch % args.valid_freq == 0:
             with torch.no_grad():
                 l_ranks, r_ranks = test(valid_set, subsample=10)
-
                 l_mean = l_ranks.mean()
                 r_mean = r_ranks.mean()
                 l_mrr = (1. / l_ranks).mean()
@@ -606,24 +743,8 @@ def main(args):
                 avg_h10 = (l_h10+r_h10)/2
                 avg_h5 = (l_h5+r_h5)/2
 
-            create_or_append(test_val_monitor, 'validation l_avg_rank', l_mean)
-            create_or_append(test_val_monitor, 'validation r_avg_rank', r_mean)
-            create_or_append(test_val_monitor, 'validation avg_rank', (l_mean+r_mean)/2)
-            create_or_append(test_val_monitor, 'validation l_mrr', l_mrr)
-            create_or_append(test_val_monitor, 'validation r_mrr', r_mrr)
-            create_or_append(test_val_monitor, 'validation mrr', (l_mrr+r_mrr)/2)
-            create_or_append(test_val_monitor, 'validation l_h10', l_h10)
-            create_or_append(test_val_monitor, 'validation r_h10', r_h10)
-            create_or_append(test_val_monitor, 'validation h10', (l_h10+r_h10)/2)
-            create_or_append(test_val_monitor, 'validation l_h5', l_h5)
-            create_or_append(test_val_monitor, 'validation r_h5', r_h5)
-            create_or_append(test_val_monitor, 'validation h5', (l_h5+r_h5)/2)
+            test_fairness(valid_set)
 
-            logging.info("#######################################")
-            for k in test_val_monitor:
-                if k.startswith('validation'):
-                    logging.info("{:<30} {:10.5f}".format(k, test_val_monitor[k][-1]))
-            logging.info("#######################################")
             joblib.dump({'l_ranks':l_ranks, 'r_ranks':r_ranks}, args.outname_base+'epoch{}_validation_ranks.pkl'.format(epoch), compress=9)
             if args.do_log: # Tensorboard logging
                 tflogger.scalar_summary('Mean Rank',float(avg_mr),epoch)
@@ -644,25 +765,6 @@ def main(args):
             l_h5 = (l_ranks <= 5).mean()
             r_h5 = (r_ranks <= 5).mean()
 
-            create_or_append(test_val_monitor, 'test l_avg_rank', l_mean)
-            create_or_append(test_val_monitor, 'test r_avg_rank', r_mean)
-            create_or_append(test_val_monitor, 'test avg_rank', (l_mean+r_mean)/2)
-            create_or_append(test_val_monitor, 'test l_mrr', l_mrr)
-            create_or_append(test_val_monitor, 'test r_mrr', r_mrr)
-            create_or_append(test_val_monitor, 'test mrr', (l_mrr+r_mrr)/2)
-            create_or_append(test_val_monitor, 'test l_h10', l_h10)
-            create_or_append(test_val_monitor, 'test r_h10', r_h10)
-            create_or_append(test_val_monitor, 'test h10', (l_h10+r_h10)/2)
-            create_or_append(test_val_monitor, 'test l_h5', l_h5)
-            create_or_append(test_val_monitor, 'test r_h5', r_h5)
-            create_or_append(test_val_monitor, 'test h5', (l_h5+r_h5)/2)
-
-            logging.info("=======================================")
-            for k in test_val_monitor:
-                if k.startswith('test'):
-                    logging.info("{:<30} {:10.5f}".format(k, test_val_monitor[k][-1]))
-            logging.info("=======================================")
-
     l_ranks, r_ranks = test(test_set)
     l_mean = l_ranks.mean()
     r_mean = r_ranks.mean()
@@ -673,29 +775,8 @@ def main(args):
     l_h5 = (l_ranks <= 5).mean()
     r_h5 = (r_ranks <= 5).mean()
 
-    create_or_append(test_val_monitor, 'test l_avg_rank', l_mean)
-    create_or_append(test_val_monitor, 'test r_avg_rank', r_mean)
-    create_or_append(test_val_monitor, 'test avg_rank', (l_mean+r_mean)/2)
-    create_or_append(test_val_monitor, 'test l_mrr', l_mrr)
-    create_or_append(test_val_monitor, 'test r_mrr', r_mrr)
-    create_or_append(test_val_monitor, 'test mrr', (l_mrr+r_mrr)/2)
-    create_or_append(test_val_monitor, 'test l_h10', l_h10)
-    create_or_append(test_val_monitor, 'test r_h10', r_h10)
-    create_or_append(test_val_monitor, 'test h10', (l_h10+r_h10)/2)
-    create_or_append(test_val_monitor, 'test l_h5', l_h5)
-    create_or_append(test_val_monitor, 'test r_h5', r_h5)
-    create_or_append(test_val_monitor, 'test h5', (l_h5+r_h5)/2)
-
-    logging.info("=======================================")
-    for k in test_val_monitor:
-        if k.startswith('test'):
-            logging.info("{:<30} {:10.5f}".format(k, test_val_monitor[k][-1]))
-    logging.info("=======================================")
-
     modelD.save(args.outname_base+'D_final.pts')
-
     joblib.dump({'l_ranks':l_ranks, 'r_ranks':r_ranks}, args.outname_base+'test_ranks.pkl', compress=9)
-    logging.info("COMPLETE!!!")
 
 if __name__ == '__main__':
     main(parse_args())

@@ -82,6 +82,7 @@ def main():
 
     ''' Count attributes '''
     train_attr_count = count_attributes(train_data, attr_to_idx)
+    valid_attr_count = count_attributes(valid_data, attr_to_idx)
 
     ''' Reindex Attribute Dictionary with 50 Most Common '''
     train_reindex_attr_idx = reindex_attributes(train_attr_count.most_common(50))
@@ -95,6 +96,7 @@ def main():
     json.dump(ent_to_idx, open('./data/Attributes_%s-ent_to_idx.json' % args.dataset, 'w'))
     json.dump(attr_to_idx, open('./data/Attributes_%s-attr_to_idx.json' % args.dataset, 'w'))
     json.dump(train_reindex_attr_idx, open('./data/Attributes_%s-reindex_attr_to_idx.json' % args.dataset, 'w'))
+    json.dump(train_attr_count, open('./data/Attributes_%s-attr_count.json' % args.dataset, 'w'))
 
     print("Dataset: %s" % args.dataset)
     print("# entities: %s; # Attributes: %s" % (len(ent_to_idx),
