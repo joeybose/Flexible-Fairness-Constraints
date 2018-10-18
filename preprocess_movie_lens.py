@@ -13,6 +13,8 @@ def make_dataset(load_sidechannel=False):
         users = pd.read_csv('./ml-100k/u.user', sep='|', names=u_cols,
                             encoding='latin-1', parse_dates=True)
         # ipdb.set_trace()
+        bins = np.linspace(5, 75, num=15, endpoint=True)
+        inds = np.digitize(users['age'].values, bins)
         m_cols = ['movie_id', 'title', 'release_date', 'video_release_date', 'imdb_url']
         movies = pd.read_csv('./ml-100k/u.item', sep='|', names=m_cols, usecols=range(5),
                              encoding='latin-1')
