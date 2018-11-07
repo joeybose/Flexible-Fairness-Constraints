@@ -1,3 +1,4 @@
+from comet_ml import Experiment
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -244,7 +245,7 @@ def mask_fairDiscriminators(discriminators, mask):
     return (d for d, s in zip(discriminators, mask) if s)
 
 def train(data_loader, counter, args, train_hash, modelD, optimizerD,\
-        tflogger, fairD_set, optimizer_fairD_set, filter_set):
+        tflogger, fairD_set, optimizer_fairD_set, filter_set, experiment):
 
     lossesD = []
     monitor_grads = []
@@ -311,7 +312,6 @@ def train(data_loader, counter, args, train_hash, modelD, optimizerD,\
                         for filter_ in masked_filter_set:
                             if filter_ is not None:
                                 filter_emb += filter_(p_lhs_emb)
-                        # filter_emb = filter_emb / torch.Tensor(constant).cuda()
                     else:
                         filter_emb = p_lhs_emb
 
@@ -395,28 +395,20 @@ def train(data_loader, counter, args, train_hash, modelD, optimizerD,\
                     occ_acc = 100. * occupation_correct / total_ent
                     age_acc = 100. * age_correct / total_ent
                     attribute = fairD_disc.attribute
-                    # tflogger.scalar_summary(attribute + ' Train FairD Accuracy',float(acc),counter)
-                    # tflogger.scalar_summary(attribute + ' Train FairD Accuracy',float(acc),counter)
-                    # tflogger.scalar_summary('Train Fairness Discriminator,\
-                            # Precision',float(mean_precision),counter)
-                    # tflogger.scalar_summary('Train Fairness Discriminator,\
-                            # Recall',float(mean_recall),counter)
-                    # tflogger.scalar_summary('Train Fairness Discriminator,\
-                            # F-score',float(mean_fscore),counter)
 
     ''' Logging for end of epoch '''
-    # if args.use_attr or args.use_multi_attr:
-        # fairD_gender_grad_norm = monitor_grad_norm(fairD_gender)
-        # fairD_gender_weight_norm = monitor_weight_norm(fairD_gender)
-
     if args.do_log: # Tensorboard logging
         tflogger.scalar_summary('TransD Loss',float(lossD),counter)
+        experiment.log_metric("TransD Loss",float(lossD),step=counter)
         if fairD_set[0] is not None:
             tflogger.scalar_summary('Fair Gender Disc Loss',float(fairD_gender_loss),counter)
+            experiment.log_metric("Fair Gender Disc Loss",float(fairD_gender_loss),step=counter)
         if fairD_set[1] is not None:
             tflogger.scalar_summary('Fair Occupation Disc Loss',float(fairD_occupation_loss),counter)
+            experiment.log_metric("Fair Occupation Disc Loss",float(fairD_occupation_loss),step=counter)
         if fairD_set[2] is not None:
             tflogger.scalar_summary('Fair Age Disc Loss',float(fairD_age_loss),counter)
+            experiment.log_metric("Fair Age Disc Loss",float(fairD_age_loss),step=counter)
 
 def test_compositional_fairness(dataset,args,modelD,\
         fairD_set,filter_set,attributes,epoch):
@@ -471,7 +463,8 @@ def test_compositional_fairness(dataset,args,modelD,\
     print("Occupation Accuracy %f " %(occupation_acc))
     print("Age Accuracy %f " %(age_acc))
 
-def test_fairness(dataset,args,modelD,tflogger,fairD,attribute,epoch,filter_=None):
+def test_fairness(dataset,args,modelD,tflogger,experiment,fairD,\
+        attribute,epoch,filter_=None,retrain=False):
 
     test_loader = DataLoader(dataset, num_workers=1, batch_size=4096, collate_fn=collate_fn)
     correct = 0
@@ -479,6 +472,7 @@ def test_fairness(dataset,args,modelD,tflogger,fairD,attribute,epoch,filter_=Non
     precision_list = []
     recall_list = []
     fscore_list = []
+
     if args.show_tqdm:
         data_itr = tqdm(enumerate(test_loader))
     else:
@@ -501,6 +495,7 @@ def test_fairness(dataset,args,modelD,tflogger,fairD,attribute,epoch,filter_=Non
         else:
             l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
                     average='micro')
+
         precision = l_precision
         recall = l_recall
         fscore = l_fscore
@@ -515,10 +510,14 @@ def test_fairness(dataset,args,modelD,tflogger,fairD,attribute,epoch,filter_=Non
         mean_precision = np.mean(np.asarray(precision_list))
         mean_recall = np.mean(np.asarray(recall_list))
         mean_fscore = np.mean(np.asarray(fscore_list))
+        if retrain:
+            attribute = 'Retrained_D_' + attribute
         tflogger.scalar_summary(attribute +' Valid FairD Accuracy',float(acc),epoch)
         tflogger.scalar_summary(attribute + ' Valid FairD F-score',float(mean_fscore),epoch)
+        experiment.log_metric(attribute + "Valid FairD Accuracy",float(acc),step=epoch)
+        experiment.log_metric(attribute + "Valid FairD F-score",float(mean_fscore),step=epoch)
 
-def test(dataset, args, all_hash, modelD, tflogger,subsample=1):
+def test(dataset, args, all_hash, modelD, subsample=1):
     l_ranks, r_ranks = [], []
     test_loader = DataLoader(dataset, num_workers=1, collate_fn=collate_fn)
 
@@ -567,7 +566,7 @@ def test(dataset, args, all_hash, modelD, tflogger,subsample=1):
     return l_ranks, r_ranks
 
 def retrain_disc(args,train_loader,train_hash,test_set,modelD,optimizerD,tflogger,\
-        gender_filter,occupation_filter,age_filter,attribute):
+        experiment,gender_filter,occupation_filter,age_filter,attribute):
 
     if args.use_trained_filters:
         print("Retrain New Discriminator with Filter on %s" %(attribute))
@@ -641,6 +640,39 @@ def retrain_disc(args,train_loader,train_hash,test_set,modelD,optimizerD,tflogge
             freeze_model(filter_)
     freeze_model(modelD)
 
+    with experiment.test():
+        for epoch in tqdm(range(1, args.num_epochs + 1)):
+            train(train_loader,epoch,args,train_hash,modelD,optimizerD,\
+                    tflogger,new_fairD_set,new_optimizer_fairD_set,filter_set,experiment)
+            gc.collect()
+            if args.decay_lr:
+                if args.decay_lr == 'ReduceLROnPlateau':
+                    schedulerD.step(monitor['D_loss_epoch_avg'])
+                else:
+                    schedulerD.step()
+
+            if epoch % args.valid_freq == 0:
+                if args.use_attr:
+                    test_fairness(test_set,args, modelD,tflogger,experiment,\
+                            fairD_gender, attribute='gender',epoch=epoch,\
+                            retrain=True)
+                    test_fairness(test_set,args,modelD,tflogger,experiment,\
+                            fairD_occupation,attribute='occupation',epoch=epoch,\
+                            retrain=True)
+                    test_fairness(test_set,args, modelD,tflogger,experiment,\
+                            fairD_age,attribute='age',epoch=epoch,retrain=True)
+                elif args.use_gender_attr:
+                    test_fairness(test_set,args,modelD,tflogger,experiment,\
+                            fairD_gender, attribute='gender',epoch=epoch,\
+                            retrain=True)
+                elif args.use_occ_attr:
+                    test_fairness(test_set,args,modelD,tflogger,experiment,\
+                            fairD_occupation,attribute='occupation',epoch=epoch,\
+                            retrain=True)
+                elif args.use_age_attr:
+                    test_fairness(test_set,args,modelD,tflogger,experiment,\
+                            fairD_age,attribute='age',epoch=epoch,retrain=True)
+
 def main(args):
     train_set = KBDataset(args.train_ratings, args.prefetch_to_gpu)
     test_set = KBDataset(args.test_ratings, args.prefetch_to_gpu)
@@ -656,6 +688,13 @@ def main(args):
         shutil.rmtree(logdir)
     if not os.path.exists(logdir):
         os.makedirs(logdir)
+
+    ''' Comet Logging '''
+    experiment = Experiment(api_key="Ht9lkWvTm58fRo9ccgpabq5zV",
+                        project_name="graph-fairness", workspace="joeybose")
+
+    # ipdb.set_trace()
+    # experiment.log_multiple_params(args)
 
     tflogger = tfLogger(logdir)
     modelD = TransD(args.num_ent, args.num_rel, args.embed_dim, args.p)
@@ -739,18 +778,6 @@ def main(args):
     optimizer_fairD_set = [optimizer_fairD_gender, optimizer_fairD_occupation,\
             optimizer_fairD_age]
 
-    # if args.freeze_transD and args.load_transD:
-        # l_ranks, r_ranks = test(test_set,args, all_hash, modelD,tflogger)
-        # l_mean = l_ranks.mean()
-        # r_mean = r_ranks.mean()
-        # l_mrr = (1. / l_ranks).mean()
-        # r_mrr = (1. / r_ranks).mean()
-        # l_h10 = (l_ranks <= 10).mean()
-        # r_h10 = (r_ranks <= 10).mean()
-        # l_h5 = (l_ranks <= 5).mean()
-        # r_h5 = (r_ranks <= 5).mean()
-        # print('Mean Rank %d' % ((l_mean + r_mean)/2))
-
     D_monitor = OrderedDict()
     test_val_monitor = OrderedDict()
 
@@ -773,25 +800,71 @@ def main(args):
     if args.freeze_transD:
         freeze_model(modelD)
 
-    # retrain_disc(args,train_loader,test_set,0,all_hash,train_hash,modelD,optimizerD,\
-            # schedulerD,tflogger,gender_filter,occupation_filter,age_filter,attribute='gender')
-
     ''' Joint Training '''
     if not args.dont_train:
-        for epoch in tqdm(range(1, args.num_epochs + 1)):
-            train(train_loader,epoch,args,train_hash,modelD,optimizerD,\
-                    tflogger,fairD_set,optimizer_fairD_set,filter_set)
-            gc.collect()
-            if args.decay_lr:
-                if args.decay_lr == 'ReduceLROnPlateau':
-                    schedulerD.step(monitor['D_loss_epoch_avg'])
-                else:
-                    schedulerD.step()
+        with experiment.train():
+            for epoch in tqdm(range(1, args.num_epochs + 1)):
+                experiment.log_current_epoch(epoch)
+                train(train_loader,epoch,args,train_hash,modelD,optimizerD,\
+                        tflogger,fairD_set,optimizer_fairD_set,filter_set,experiment)
+                gc.collect()
+                if args.decay_lr:
+                    if args.decay_lr == 'ReduceLROnPlateau':
+                        schedulerD.step(monitor['D_loss_epoch_avg'])
+                    else:
+                        schedulerD.step()
 
-            if epoch % args.valid_freq == 0:
-                with torch.no_grad():
-                    l_ranks, r_ranks = test(test_set, args, all_hash,\
-                            modelD,tflogger,subsample=10)
+                if epoch % args.valid_freq == 0:
+                    with torch.no_grad():
+                        l_ranks, r_ranks = test(test_set, args, all_hash,\
+                                modelD,subsample=10)
+                        l_mean = l_ranks.mean()
+                        r_mean = r_ranks.mean()
+                        l_mrr = (1. / l_ranks).mean()
+                        r_mrr = (1. / r_ranks).mean()
+                        l_h10 = (l_ranks <= 10).mean()
+                        r_h10 = (r_ranks <= 10).mean()
+                        l_h5 = (l_ranks <= 5).mean()
+                        r_h5 = (r_ranks <= 5).mean()
+                        avg_mr = (l_mean + r_mean)/2
+                        avg_mrr = (l_mrr+r_mrr)/2
+                        avg_h10 = (l_h10+r_h10)/2
+                        avg_h5 = (l_h5+r_h5)/2
+
+                    if args.use_attr:
+                        test_fairness(test_set,args,modelD,tflogger,experiment,\
+                                fairD_gender, attribute='gender',epoch=epoch)
+                        test_fairness(test_set,args,modelD,tflogger,experiment,\
+                                fairD_occupation,attribute='occupation', epoch=epoch)
+                        test_fairness(test_set,args,modelD,tflogger,experiment,\
+                                fairD_age,attribute='age', epoch=epoch)
+                    elif args.use_gender_attr:
+                        test_fairness(test_set,args,modelD,tflogger,experiment,\
+                                fairD_gender, attribute='gender',epoch=epoch)
+                    elif args.use_occ_attr:
+                        test_fairness(test_set,args,modelD,tflogger,experiment,\
+                                fairD_occupation,attribute='occupation', epoch=epoch)
+                    elif args.use_age_attr:
+                        test_fairness(test_set,args,modelD,tflogger,experiment,\
+                                fairD_age,attribute='age', epoch=epoch)
+
+                    joblib.dump({'l_ranks':l_ranks, 'r_ranks':r_ranks},args.outname_base+\
+                            'epoch{}_validation_ranks.pkl'.format(epoch), compress=9)
+
+                    if args.do_log: # Tensorboard logging
+                        tflogger.scalar_summary('Mean Rank',float(avg_mr),epoch)
+                        tflogger.scalar_summary('Mean Reciprocal Rank',float(avg_mrr),epoch)
+                        tflogger.scalar_summary('Hit @10',float(avg_h10),epoch)
+                        tflogger.scalar_summary('Hit @5',float(avg_h5),epoch)
+                        experiment.log_metric("Mean Rank",float(avg_mr),step=epoch)
+                        experiment.log_metric("Mean Reciprocal Rank",\
+                                float(avg_mrr),step=epoch)
+                        experiment.log_metric("Hit @10",float(avg_h10),step=epoch)
+                        experiment.log_metric("Hit @5",float(avg_h5),step=epoch)
+
+                if epoch % (args.valid_freq * 5) == 0:
+                    l_ranks, r_ranks = test(test_set,args, all_hash,\
+                            modelD)
                     l_mean = l_ranks.mean()
                     r_mean = r_ranks.mean()
                     l_mrr = (1. / l_ranks).mean()
@@ -800,51 +873,8 @@ def main(args):
                     r_h10 = (r_ranks <= 10).mean()
                     l_h5 = (l_ranks <= 5).mean()
                     r_h5 = (r_ranks <= 5).mean()
-                    avg_mr = (l_mean + r_mean)/2
-                    avg_mrr = (l_mrr+r_mrr)/2
-                    avg_h10 = (l_h10+r_h10)/2
-                    avg_h5 = (l_h5+r_h5)/2
 
-                if args.use_attr:
-                    test_fairness(test_set,args, modelD,tflogger,\
-                            fairD_gender, attribute='gender',epoch=epoch)
-                    test_fairness(test_set,args,modelD,tflogger,\
-                            fairD_occupation,attribute='occupation', epoch=epoch)
-                    test_fairness(test_set,args, modelD,tflogger,\
-                            fairD_age,attribute='age', epoch=epoch)
-                elif args.use_gender_attr:
-                    test_fairness(test_set,args,modelD,tflogger,\
-                            fairD_gender, attribute='gender',epoch=epoch)
-                elif args.use_occ_attr:
-                    test_fairness(test_set,args,modelD,tflogger,\
-                            fairD_occupation,attribute='occupation', epoch=epoch)
-                elif args.use_age_attr:
-                    test_fairness(test_set,args,modelD,tflogger,\
-                            fairD_age,attribute='age', epoch=epoch)
-
-                joblib.dump({'l_ranks':l_ranks, 'r_ranks':r_ranks},args.outname_base+\
-                        'epoch{}_validation_ranks.pkl'.format(epoch), compress=9)
-                if args.do_log: # Tensorboard logging
-                    tflogger.scalar_summary('Mean Rank',float(avg_mr),epoch)
-                    tflogger.scalar_summary('Mean Reciprocal Rank',float(avg_mrr),epoch)
-                    tflogger.scalar_summary('Hit @10',float(avg_h10),epoch)
-                    tflogger.scalar_summary('Hit @5',float(avg_h5),epoch)
-
-                modelD.save(args.outname_base+'D_epoch{}.pts'.format(epoch))
-
-            if epoch % (args.valid_freq * 5) == 0:
-                l_ranks, r_ranks = test(test_set,args, all_hash,\
-                        modelD,tflogger)
-                l_mean = l_ranks.mean()
-                r_mean = r_ranks.mean()
-                l_mrr = (1. / l_ranks).mean()
-                r_mrr = (1. / r_ranks).mean()
-                l_h10 = (l_ranks <= 10).mean()
-                r_h10 = (r_ranks <= 10).mean()
-                l_h5 = (l_ranks <= 5).mean()
-                r_h5 = (r_ranks <= 5).mean()
-
-        l_ranks, r_ranks = test(test_set,args, all_hash, modelD,tflogger)
+        l_ranks, r_ranks = test(test_set,args, all_hash, modelD)
         l_mean = l_ranks.mean()
         r_mean = r_ranks.mean()
         l_mrr = (1. / l_ranks).mean()
@@ -890,13 +920,13 @@ def main(args):
         args.use_trained_filters = True
         ''' Test With Filters '''
         retrain_disc(args,train_loader,train_hash,test_set,modelD,\
-                optimizerD,tflogger_filter,gender_filter,occupation_filter=None,\
+                optimizerD,tflogger_filter,experiment,gender_filter,occupation_filter=None,\
                 age_filter=None,attribute='gender')
         retrain_disc(args,train_loader,train_hash,test_set,modelD,\
-                optimizerD,tflogger_filter,occupation_filter=occupation_filter,\
+                optimizerD,tflogger_filter,experiment,occupation_filter=occupation_filter,\
                 gender_filter=None,age_filter=None,attribute='occupation')
         retrain_disc(args,train_loader,train_hash,test_set,modelD,\
-                optimizerD,tflogger_filter,age_filter=age_filter,gender_filter=None,\
+                optimizerD,tflogger_filter,experiment,age_filter=age_filter,gender_filter=None,\
                 occupation_filter=None,attribute='age')
 
         args.use_trained_filters = False
@@ -909,15 +939,14 @@ def main(args):
 
         '''Test Without Filters '''
         retrain_disc(args,train_loader,train_hash,test_set,modelD,\
-                optimizerD,tflogger_no_filter,gender_filter=None,\
+                optimizerD,tflogger_no_filter,experiment,gender_filter=None,\
                 occupation_filter=None,age_filter=None,attribute='gender')
         retrain_disc(args,train_loader,train_hash,test_set,modelD,\
-                optimizerD,tflogger_no_filter,gender_filter=None,\
+                optimizerD,tflogger_no_filter,experiment,gender_filter=None,\
                 occupation_filter=None,age_filter=None,attribute='occupation')
         retrain_disc(args,train_loader,train_hash,test_set,modelD,\
-                optimizerD,tflogger_no_filter,gender_filter=None,\
+                optimizerD,tflogger_no_filter,experiment,gender_filter=None,\
                 occupation_filter=None,age_filter=None,attribute='age')
-        # if args.use_trained_filters:
 
 if __name__ == '__main__':
     main(parse_args())
