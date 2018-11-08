@@ -231,6 +231,10 @@ class DemParDisc(nn.Module):
             users_occupation = [occ_to_idx[occ] for occ in users_occupation]
             self.users_sensitive = np.ascontiguousarray(users_occupation)
             self.out_dim = len(users_occupation_list)
+        elif attribute == 'random':
+            users_random = attribute_data[0]['rand']
+            self.users_sensitive = np.ascontiguousarray(users_random)
+            self.out_dim = 1
         else:
             users_age = attribute_data[0]['age'].values
             users_age_list = sorted(set(users_age))
@@ -250,7 +254,7 @@ class DemParDisc(nn.Module):
         h2 = F.leaky_relu(self.W2(h1))
         h3 = F.leaky_relu(self.W3(h2))
         scores = self.W4(h3)
-        if self.attribute == 'gender':
+        if self.attribute == 'gender' or self.attribute == 'random':
             A_labels = Variable(torch.Tensor(self.users_sensitive[ents])).cuda()
             A_labels = A_labels.unsqueeze(1)
             if self.cross_entropy:

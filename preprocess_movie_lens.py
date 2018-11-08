@@ -12,7 +12,6 @@ def make_dataset(load_sidechannel=False):
         u_cols = ['user_id', 'age', 'sex', 'occupation', 'zip_code']
         users = pd.read_csv('./ml-100k/u.user', sep='|', names=u_cols,
                             encoding='latin-1', parse_dates=True)
-        # ipdb.set_trace()
         bins = np.linspace(5, 75, num=15, endpoint=True)
         inds = np.digitize(users['age'].values, bins)
         m_cols = ['movie_id', 'title', 'release_date', 'video_release_date', 'imdb_url']
@@ -37,6 +36,7 @@ def make_dataset(load_sidechannel=False):
     test_ratings=test_ratings.reindex(columns=columnsTitles)-1
     users['user_id'] = users['user_id'] - 1
     movies['movie_id'] = movies['movie_id'] - 1
+
     if load_sidechannel:
         return train_ratings,test_ratings,users,movies
     else:
