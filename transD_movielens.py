@@ -34,6 +34,63 @@ ltensor = torch.LongTensor
 v2np = lambda v: v.data.cpu().numpy()
 USE_SPARSE_EMB = True
 
+def optimizer(params, mode, *args, **kwargs):
+    if mode == 'SGD':
+        opt = optim.SGD(params, *args, momentum=0., **kwargs)
+    elif mode.startswith('nesterov'):
+        momentum = float(mode[len('nesterov'):])
+        opt = optim.SGD(params, *args, momentum=momentum, nesterov=True, **kwargs)
+    elif mode.lower() == 'adam':
+        betas = kwargs.pop('betas', (.9, .999))
+        opt = optim.Adam(params, *args, betas=betas, amsgrad=True, **kwargs)
+    elif mode.lower() == 'adam_hyp2':
+        betas = kwargs.pop('betas', (.5, .99))
+        opt = optim.Adam(params, *args, betas=betas, amsgrad=True, **kwargs)
+    elif mode.lower() == 'adam_hyp3':
+        betas = kwargs.pop('betas', (0., .99))
+        opt = optim.Adam(params, *args, betas=betas, amsgrad=True, **kwargs)
+    elif mode.lower() == 'adam_sparse':
+        betas = kwargs.pop('betas', (.9, .999))
+        opt = optim.SparseAdam(params, *args, betas=betas)
+    elif mode.lower() == 'adam_sparse_hyp2':
+        betas = kwargs.pop('betas', (.5, .99))
+        opt = optim.SparseAdam(params, *args, betas=betas)
+    elif mode.lower() == 'adam_sparse_hyp3':
+        betas = kwargs.pop('betas', (.0, .99))
+        opt = optim.SparseAdam(params, *args, betas=betas)
+    else:
+        raise NotImplementedError()
+    return opt
+
+def lr_scheduler(optimizer, decay_lr, num_epochs):
+    if decay_lr in ('ms1', 'ms2', 'ms3'):
+        decay_lr = int(decay_lr[-1])
+        lr_milestones = [2 ** x for x in xrange(10-decay_lr, 10) if 2 ** x < num_epochs]
+        scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=lr_milestones, gamma=0.1)
+
+    elif decay_lr.startswith('step_exp_'):
+        gamma = float(decay_lr[len('step_exp_'):])
+        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
+
+    elif decay_lr.startswith('halving_step'):
+        step_size = int(decay_lr[len('halving_step'):])
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=0.5)
+
+    elif decay_lr.startswith('ReduceLROnPlateau'):
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, cooldown=10, threshold=1e-3, factor=0.1, min_lr=1e-7, verbose=True)
+
+    elif decay_lr == '':
+        scheduler = None
+    else:
+        raise NotImplementedError()
+
+    return scheduler
+
+def freeze_model(model):
+    model.eval()
+    for params in model.parameters():
+        params.requires_grad = False
+
 class MarginRankingLoss(nn.Module):
     def __init__(self, margin):
         super(MarginRankingLoss, self).__init__()
@@ -437,7 +494,7 @@ def retrain_disc(args,train_loader,train_hash,test_set,modelD,optimizerD,\
     args.use_cross_entropy = True
     args.sample_mask = False
     args.freeze_transD = True
-    new_fairD_gender,new_fairD_occupation,new_fairD_age,new_fair_random = None,None,None,None
+    new_fairD_gender,new_fairD_occupation,new_fairD_age,new_fairD_random = None,None,None,None
     new_optimizer_fairD_gender,new_optimizer_fairD_occupation,\
             new_optimizer_fairD_age,new_optimizer_fairD_random = None,None,None,None
 
@@ -499,8 +556,8 @@ def retrain_disc(args,train_loader,train_hash,test_set,modelD,optimizerD,\
     elif args.use_random_attr:
         attr_data = [args.users,args.movies]
         new_fairD_random = DemParDisc(args.embed_dim,attr_data,\
-            attribute='random',use_cross_entropy=args.use_cross_entropy)
-        new_optimizer_fairD_random = optimizer(new_fairD_age.parameters(),'adam')
+                attribute='random',use_cross_entropy=args.use_cross_entropy)
+        new_optimizer_fairD_random = optimizer(new_fairD_random.parameters(),'adam')
         new_fairD_random.cuda()
         fairD_disc = new_fairD_random
         fair_optim = new_optimizer_fairD_random
@@ -525,33 +582,27 @@ def retrain_disc(args,train_loader,train_hash,test_set,modelD,optimizerD,\
             train(train_loader,epoch,args,train_hash,modelD,optimizerD,\
                     new_fairD_set,new_optimizer_fairD_set,filter_set,experiment)
             gc.collect()
-            if args.decay_lr:
-                if args.decay_lr == 'ReduceLROnPlateau':
-                    schedulerD.step(monitor['D_loss_epoch_avg'])
-                else:
-                    schedulerD.step()
-
             if epoch % args.valid_freq == 0:
                 if args.use_attr:
                     test_fairness(test_set,args, modelD,experiment,\
-                            fairD_gender, attribute='gender',epoch=epoch,\
+                            new_fairD_gender, attribute='gender',epoch=epoch,\
                             retrain=True)
                     test_fairness(test_set,args,modelD,experiment,\
-                            fairD_occupation,attribute='occupation',epoch=epoch,\
+                            new_fairD_occupation,attribute='occupation',epoch=epoch,\
                             retrain=True)
                     test_fairness(test_set,args, modelD,experiment,\
-                            fairD_age,attribute='age',epoch=epoch,retrain=True)
+                            new_fairD_age,attribute='age',epoch=epoch,retrain=True)
                 elif args.use_gender_attr:
                     test_fairness(test_set,args,modelD,experiment,\
-                            fairD_gender, attribute='gender',epoch=epoch,\
+                            new_fairD_gender, attribute='gender',epoch=epoch,\
                             retrain=True)
                 elif args.use_occ_attr:
                     test_fairness(test_set,args,modelD,experiment,\
-                            fairD_occupation,attribute='occupation',epoch=epoch,\
+                            new_fairD_occupation,attribute='occupation',epoch=epoch,\
                             retrain=True)
                 elif args.use_age_attr:
                     test_fairness(test_set,args,modelD,experiment,\
-                            fairD_age,attribute='age',epoch=epoch,retrain=True)
+                            new_fairD_age,attribute='age',epoch=epoch,retrain=True)
                 elif args.use_random_attr:
                     test_fairness(test_set,args,modelD,experiment,\
-                            fairD_age,attribute='random',epoch=epoch,retrain=True)
+                            new_fairD_random,attribute='random',epoch=epoch,retrain=True)

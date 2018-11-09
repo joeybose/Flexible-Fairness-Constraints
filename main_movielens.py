@@ -58,63 +58,6 @@ class KBDataset(Dataset):
         if self.prefetch_to_gpu:
             self.dataset = self.dataset.cuda().contiguous()
 
-def optimizer(params, mode, *args, **kwargs):
-    if mode == 'SGD':
-        opt = optim.SGD(params, *args, momentum=0., **kwargs)
-    elif mode.startswith('nesterov'):
-        momentum = float(mode[len('nesterov'):])
-        opt = optim.SGD(params, *args, momentum=momentum, nesterov=True, **kwargs)
-    elif mode.lower() == 'adam':
-        betas = kwargs.pop('betas', (.9, .999))
-        opt = optim.Adam(params, *args, betas=betas, amsgrad=True, **kwargs)
-    elif mode.lower() == 'adam_hyp2':
-        betas = kwargs.pop('betas', (.5, .99))
-        opt = optim.Adam(params, *args, betas=betas, amsgrad=True, **kwargs)
-    elif mode.lower() == 'adam_hyp3':
-        betas = kwargs.pop('betas', (0., .99))
-        opt = optim.Adam(params, *args, betas=betas, amsgrad=True, **kwargs)
-    elif mode.lower() == 'adam_sparse':
-        betas = kwargs.pop('betas', (.9, .999))
-        opt = optim.SparseAdam(params, *args, betas=betas)
-    elif mode.lower() == 'adam_sparse_hyp2':
-        betas = kwargs.pop('betas', (.5, .99))
-        opt = optim.SparseAdam(params, *args, betas=betas)
-    elif mode.lower() == 'adam_sparse_hyp3':
-        betas = kwargs.pop('betas', (.0, .99))
-        opt = optim.SparseAdam(params, *args, betas=betas)
-    else:
-        raise NotImplementedError()
-    return opt
-
-def lr_scheduler(optimizer, decay_lr, num_epochs):
-    if decay_lr in ('ms1', 'ms2', 'ms3'):
-        decay_lr = int(decay_lr[-1])
-        lr_milestones = [2 ** x for x in xrange(10-decay_lr, 10) if 2 ** x < num_epochs]
-        scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=lr_milestones, gamma=0.1)
-
-    elif decay_lr.startswith('step_exp_'):
-        gamma = float(decay_lr[len('step_exp_'):])
-        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
-
-    elif decay_lr.startswith('halving_step'):
-        step_size = int(decay_lr[len('halving_step'):])
-        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=0.5)
-
-    elif decay_lr.startswith('ReduceLROnPlateau'):
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, cooldown=10, threshold=1e-3, factor=0.1, min_lr=1e-7, verbose=True)
-
-    elif decay_lr == '':
-        scheduler = None
-    else:
-        raise NotImplementedError()
-
-    return scheduler
-
-def freeze_model(model):
-    model.eval()
-    for params in model.parameters():
-        params.requires_grad = False
-
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--show_tqdm', type=int, default=0, help='')
@@ -159,6 +102,12 @@ def parse_args():
     args.use_cuda = torch.cuda.is_available()
     args.train_ratings,args.test_ratings,args.users,args.movies = make_dataset(True)
 
+    ''' Offset Movie ID's by # users because in TransD they share the same
+    embedding Layer '''
+
+    args.train_ratings['movie_id'] += len(args.users)
+    args.test_ratings['movie_id'] += len(args.users)
+
     if args.use_random_attr:
         rand_attr = np.random.choice(2, len(args.users))
         args.users['rand'] = rand_attr
@@ -197,8 +146,6 @@ def main(args):
     experiment = Experiment(api_key="Ht9lkWvTm58fRo9ccgpabq5zV",
                         project_name="graph-fairness", workspace="joeybose")
     experiment.set_name(args.namestr)
-    if not args.do_log:
-        experiment.clean()
     modelD = TransD(args.num_ent, args.num_rel, args.embed_dim, args.p)
 
     ''' Initialize Everything to None '''
@@ -298,12 +245,12 @@ def main(args):
 
     if args.freeze_transD:
         freeze_model(modelD)
-
     ''' Joint Training '''
     if not args.dont_train:
         with experiment.train():
             for epoch in tqdm(range(1, args.num_epochs + 1)):
-                experiment.log_current_epoch(epoch)
+                if args.do_log:
+                    experiment.log_current_epoch(epoch)
                 train(train_loader,epoch,args,train_hash,modelD,optimizerD,\
                         fairD_set,optimizer_fairD_set,filter_set,experiment)
                 gc.collect()
@@ -402,7 +349,7 @@ def main(args):
             retrain_disc(args,train_loader,train_hash,test_set,modelD,\
                     optimizerD,experiment,gender_filter=None,\
                     occupation_filter=None,age_filter=None,attribute='gender')
-        if args.use_attr or args.use_occupation_attr:
+        if args.use_attr or args.use_occ_attr:
             retrain_disc(args,train_loader,train_hash,test_set,modelD,\
                     optimizerD,experiment,gender_filter=None,\
                     occupation_filter=None,age_filter=None,attribute='occupation')
