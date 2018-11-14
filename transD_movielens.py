@@ -9,6 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.nn.init import xavier_normal, xavier_uniform
 from torch.distributions import Categorical
 from sklearn.metrics import precision_recall_fscore_support
+from sklearn.metrics import roc_auc_score, accuracy_score
 import numpy as np
 import random
 import argparse
@@ -91,6 +92,25 @@ def freeze_model(model):
     for params in model.parameters():
         params.requires_grad = False
 
+def roc_auc_score_multiclass(actual_class, pred_class, average = "macro"):
+
+    #creating a set of all the unique classes using the actual class list
+    unique_class = set(actual_class)
+    roc_auc_dict = {}
+    for per_class in unique_class:
+        #creating a list of all the classes except the current class
+        other_class = [x for x in unique_class if x != per_class]
+
+        #marking the current class as 1 and all other classes as 0
+        new_actual_class = [0 if x in other_class else 1 for x in actual_class]
+        new_pred_class = [0 if x in other_class else 1 for x in pred_class]
+
+        #using the sklearn metrics method to calculate the roc_auc_score
+        roc_auc = roc_auc_score(new_actual_class, new_pred_class, average = average)
+        roc_auc_dict[per_class] = roc_auc
+
+    return roc_auc_dict
+
 class MarginRankingLoss(nn.Module):
     def __init__(self, margin):
         super(MarginRankingLoss, self).__init__()
@@ -104,18 +124,20 @@ class MarginRankingLoss(nn.Module):
 
         return scores.mean(), scores
 
-_cb_var = []
-def corrupt_batch(batch, num_ent):
+_cb_var_user = []
+_cb_var_movie = []
+def corrupt_batch(batch, num_ent, num_users, num_movies):
     # batch: ltensor type, contains positive triplets
     batch_size, _ = batch.size()
 
     corrupted = batch.clone()
 
-    if len(_cb_var) == 0:
-        _cb_var.append(ltensor(batch_size//2).cuda())
+    if len(_cb_var_user) == 0 and len(_cb_var_movie) == 0:
+        _cb_var_user.append(ltensor(batch_size//2).cuda())
+        _cb_var_movie.append(ltensor(batch_size//2).cuda())
 
-    q_samples_l = _cb_var[0].random_(0, num_ent)
-    q_samples_r = _cb_var[0].random_(0, num_ent)
+    q_samples_l = _cb_var_user[0].random_(0, num_users)
+    q_samples_r = _cb_var_movie[0].random_(num_users, num_users + num_movies - 1)
 
     corrupted[:batch_size//2, 0] = q_samples_l
     corrupted[batch_size//2:, 2] = q_samples_r
@@ -180,7 +202,8 @@ def train(data_loader, counter, args, train_hash, modelD, optimizerD,\
             masked_optimizer_fairD_set = optimizer_fairD_set
             masked_filter_set = filter_set
 
-        nce_batch, q_samples = corrupt_batch(p_batch, args.num_ent)
+        nce_batch, q_samples = corrupt_batch(p_batch,args.num_ent,\
+                args.num_users, args.num_movies)
 
         if args.filter_false_negs:
             if args.prefetch_to_gpu:
@@ -210,28 +233,27 @@ def train(data_loader, counter, args, train_hash, modelD, optimizerD,\
         ''' Update TransD Model '''
         if constant != 0 and not args.freeze_transD:
             d_outs,lhs_emb,rhs_emb = modelD(d_ins,True)
-            with torch.no_grad():
-                p_lhs_emb = lhs_emb[:len(p_batch_var)]
-                l_penalty = 0
+            p_lhs_emb = lhs_emb[:len(p_batch_var)]
+            l_penalty = 0
 
-                ''' Apply Filter or Not to Embeddings '''
-                if args.sample_mask:
-                    filter_emb = 0
-                    for filter_ in masked_filter_set:
-                        if filter_ is not None:
-                            filter_emb += filter_(p_lhs_emb)
-                else:
-                    filter_emb = p_lhs_emb
+            ''' Apply Filter or Not to Embeddings '''
+            if args.sample_mask:
+                filter_emb = 0
+                for filter_ in masked_filter_set:
+                    if filter_ is not None:
+                        filter_emb += filter_(p_lhs_emb)
+            else:
+                filter_emb = p_lhs_emb
 
-                ''' Apply Discriminators '''
-                for fairD_disc in masked_fairD_set:
-                    if fairD_disc is not None:
-                        l_penalty += fairD_disc(filter_emb,p_batch[:,0])
+            ''' Apply Discriminators '''
+            for fairD_disc in masked_fairD_set:
+                if fairD_disc is not None:
+                    l_penalty += fairD_disc(filter_emb,p_batch[:,0])
 
-                if not args.use_cross_entropy:
-                    fair_penalty = constant - l_penalty
-                else:
-                    fair_penalty = l_penalty
+            if not args.use_cross_entropy:
+                fair_penalty = constant - l_penalty
+            else:
+                fair_penalty = -1*l_penalty
         else:
             d_outs = modelD(d_ins)
             fair_penalty = Variable(torch.zeros(1)).cuda()
@@ -242,7 +264,7 @@ def train(data_loader, counter, args, train_hash, modelD, optimizerD,\
         lossD = nce_term + args.gamma*fair_penalty
 
         if not args.freeze_transD:
-            lossD.backward()
+            lossD.backward(retain_graph=True)
             optimizerD.step()
 
         ''' Update the Fair Discriminator '''
@@ -284,7 +306,7 @@ def train(data_loader, counter, args, train_hash, modelD, optimizerD,\
 
                     fairD_loss.backward(retain_graph=True)
                     fair_optim.step()
-                    l_preds, l_A_labels = fairD_disc.predict(filter_emb,p_batch[:,0],return_preds=True)
+                    l_preds, l_A_labels, probs = fairD_disc.predict(filter_emb,p_batch[:,0],return_preds=True)
                     l_correct = l_preds.eq(l_A_labels.view_as(l_preds)).sum().item()
                     if fairD_disc.attribute == 'gender':
                         l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
@@ -346,7 +368,7 @@ def test_compositional_fairness(dataset,args,modelD,\
         ''' Apply Discriminators '''
         for fairD in fairD_set:
             if fairD is not None:
-                l_preds, l_A_labels = fairD.predict(filter_emb,lhs,return_preds=True)
+                l_preds, l_A_labels, probs = fairD.predict(filter_emb,lhs,return_preds=True)
                 l_correct = l_preds.eq(l_A_labels.view_as(l_preds)).sum().item()
                 if fairD.attribute == 'gender':
                     l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
@@ -379,6 +401,8 @@ def test_fairness(dataset,args,modelD,experiment,fairD,\
     precision_list = []
     recall_list = []
     fscore_list = []
+    preds_list = []
+    labels_list = []
 
     if args.show_tqdm:
         data_itr = tqdm(enumerate(test_loader))
@@ -394,7 +418,7 @@ def test_fairness(dataset,args,modelD,experiment,fairD,\
         if filter_ is not None:
             lhs_emb = filter_(lhs_emb)
 
-        l_preds,l_A_labels = fairD.predict(lhs_emb,lhs,return_preds=True)
+        l_preds,l_A_labels,probs = fairD.predict(lhs_emb,lhs,return_preds=True)
         l_correct = l_preds.eq(l_A_labels.view_as(l_preds)).sum().item()
         if attribute == 'gender':
             l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
@@ -409,6 +433,8 @@ def test_fairness(dataset,args,modelD,experiment,fairD,\
         precision_list.append(precision)
         recall_list.append(recall)
         fscore_list.append(fscore)
+        preds_list.append(probs)
+        labels_list.append(l_A_labels.view_as(l_preds))
         correct += l_correct
         total_ent += len(lhs_emb)
 
@@ -417,10 +443,20 @@ def test_fairness(dataset,args,modelD,experiment,fairD,\
         mean_precision = np.mean(np.asarray(precision_list))
         mean_recall = np.mean(np.asarray(recall_list))
         mean_fscore = np.mean(np.asarray(fscore_list))
+        preds_list = torch.cat(preds_list,0).data.cpu().numpy()
+        labels_list = torch.cat(labels_list,0).data.cpu().numpy()
+        # else:
+            # ipdb.set_trace()
+            # AUC = roc_auc_score_multiclass(labels_list.flatten(),\
+                    # preds_list.flatten())
+
         if retrain:
             attribute = 'Retrained_D_' + attribute
-        experiment.log_metric(attribute + "Valid FairD Accuracy",float(acc),step=epoch)
-        experiment.log_metric(attribute + "Valid FairD F-score",float(mean_fscore),step=epoch)
+        experiment.log_metric(attribute + "_Valid FairD Accuracy",float(acc),step=epoch)
+        # experiment.log_metric(attribute + "_Valid FairD F-score",float(mean_fscore),step=epoch)
+        if attribute == 'gender' or attribute == 'random':
+            AUC = roc_auc_score(labels_list, preds_list)
+            experiment.log_metric(attribute + "_Valid FairD AUC",float(AUC),step=epoch)
 
 def test(dataset, args, all_hash, modelD, subsample=1):
     l_ranks, r_ranks = [], []

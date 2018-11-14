@@ -42,5 +42,49 @@ def make_dataset(load_sidechannel=False):
     else:
         return train_ratings,test_ratings,
 
+def make_dataset_1M(load_sidechannel=False):
+# ratings = np.loadtxt("ml-1m/ratings.dat", dtype=np.int32, delimiter="::")
+# ratings[:, -1] = ratings[:, -2]
+# ratings[:, -2] = ratings[:, 1]
+# ratings[:, 1] = ratings[:, -1]-1
+# num_head_nodes = int(np.max(ratings[:,0])) + 1
+# num_tail_nodes = int(np.max(ratings[:,-2])) + 1
+# ratings[:, -2] += np.max(ratings[:, 0])
+# train_data = torch.LongTensor(ratings[:, :-1])
+# # Load gender
+# gender_map = {}
+# with open("ml-1m/users.dat", "r") as fp:
+    # for line in fp:
+        # info = line.split("::")
+        # gender_map[int(info[0])] = 0 if info[1] == "M" else 1
+# users = list(gender_map.keys())
+# full_labels = [gender_map[u] for u in users]
+    r_cols = ['user_id', 'movie_id', 'rating', 'unix_timestamp']
+    ratings = pd.read_csv('./ml-1m/ratings.dat', sep='::', names=r_cols,
+			  encoding='latin-1')
+    shuffled_ratings = ratings.sample(frac=1).reset_index(drop=True)
+    train_cutoff_row = int(np.round(len(shuffled_ratings)*0.8))
+    train_ratings = shuffled_ratings[:train_cutoff_row]
+    test_ratings = shuffled_ratings[train_cutoff_row:]
+    ipdb.set_trace()
+    if load_sidechannel:
+        u_cols = ['gender', 'age', 'occupation', 'user_id']
+        users = pd.read_csv('./ml-1m/users.dat', sep='::', names=u_cols,
+                            encoding='latin-1', parse_dates=True)
+
+    train_ratings.drop( "unix_timestamp", inplace = True, axis = 1 )
+    train_ratings_matrix = train_ratings.pivot_table(index=['movie_id'],\
+            columns=['user_id'],values='rating').reset_index(drop=True)
+    test_ratings.drop( "unix_timestamp", inplace = True, axis = 1 )
+    columnsTitles=["user_id","rating","movie_id"]
+    train_ratings=train_ratings.reindex(columns=columnsTitles)-1
+    test_ratings=test_ratings.reindex(columns=columnsTitles)-1
+    users['user_id'] = users['user_id'] - 1
+    movies['movie_id'] = movies['movie_id'] - 1
+
+    if load_sidechannel:
+        return train_ratings,test_ratings,users,movies
+    else:
+        return train_ratings,test_ratings,
 # if __name__ == '__main__':
-    # make_dataset(True)
+    # make_dataset_1M(True)

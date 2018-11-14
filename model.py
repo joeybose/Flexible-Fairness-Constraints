@@ -9,6 +9,7 @@ from torch.nn.init import xavier_normal, xavier_uniform
 from torch.distributions import Categorical
 from tensorboard_logger import Logger as tfLogger
 from sklearn.metrics import precision_recall_fscore_support
+from sklearn.preprocessing import label_binarize
 import numpy as np
 import random
 import argparse
@@ -286,10 +287,11 @@ class DemParDisc(nn.Module):
         else:
             A_labels = Variable(torch.LongTensor(self.users_sensitive[ents])).cuda()
             log_probs = F.log_softmax(scores, dim=1)
+            probs = torch.exp(log_probs)
             preds = log_probs.max(1, keepdim=True)[1] # get the index of the max
             correct = preds.eq(A_labels.view_as(preds)).sum().item()
         if return_preds:
-            return preds, A_labels
+            return preds, A_labels, probs
         else:
             return correct
 

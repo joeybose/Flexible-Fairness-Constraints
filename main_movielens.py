@@ -73,7 +73,7 @@ def parse_args():
     parser.add_argument('--data_dir', type=str, default='./data/', help="Contains Pickle files")
     parser.add_argument('--num_epochs', type=int, default=1000, help='Number of training epochs (default: 500)')
     parser.add_argument('--batch_size', type=int, default=8192, help='Batch size (default: 512)')
-    parser.add_argument('--gamma', type=int, default=10, help='Tradeoff for Adversarial Penalty')
+    parser.add_argument('--gamma', type=int, default=1, help='Tradeoff for Adversarial Penalty')
     parser.add_argument('--valid_freq', type=int, default=20, help='Validate frequency in epochs (default: 50)')
     parser.add_argument('--print_freq', type=int, default=5, help='Print frequency in epochs (default: 5)')
     parser.add_argument('--embed_dim', type=int, default=50, help='Embedding dimension (default: 50)')
@@ -112,6 +112,8 @@ def parse_args():
         rand_attr = np.random.choice(2, len(args.users))
         args.users['rand'] = rand_attr
     args.num_ent = len(args.users) + len(args.movies)
+    args.num_users = len(args.users)
+    args.num_movies = len(args.movies)
     args.num_rel = 5
     if not os.path.exists(args.save_dir):
         os.makedirs(args.save_dir)
@@ -153,7 +155,6 @@ def main(args):
     optimizer_fairD_gender, optimizer_fairD_occupation, \
             optimizer_fairD_age, optimizer_fairD_random = None,None,None,None
     gender_filter, occupation_filter, age_filter = None, None, None
-
     if args.use_attr:
         attr_data = [args.users,args.movies]
         ''' Initialize Discriminators '''
@@ -245,6 +246,7 @@ def main(args):
 
     if args.freeze_transD:
         freeze_model(modelD)
+
     ''' Joint Training '''
     if not args.dont_train:
         with experiment.train():
@@ -361,6 +363,7 @@ def main(args):
             retrain_disc(args,train_loader,train_hash,test_set,modelD,\
                     optimizerD,experiment,gender_filter=None,\
                     occupation_filter=None,age_filter=None,attribute='random')
+        experiment.end()
 
 if __name__ == '__main__':
     main(parse_args())
