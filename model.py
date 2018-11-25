@@ -114,7 +114,7 @@ class TransD(nn.Module):
             return enrgs
         else:
             enrgs = (lhs + rel_es - rhs).norm(p=self.p, dim=1)
-            return enrgs,lhs,rhs
+            return enrgs,lhs,rhs,rel_es
 
     def get_embed(self, ents, rel_idxs):
         ent_embed = self.ent_embeds(ents, rel_idxs)

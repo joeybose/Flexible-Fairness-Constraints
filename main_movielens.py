@@ -71,7 +71,7 @@ def parse_args():
     parser.add_argument('--remove_old_run', action='store_true', help="remove old run")
     parser.add_argument('--use_cross_entropy', action='store_true', help="DemPar Discriminators Loss as CE")
     parser.add_argument('--data_dir', type=str, default='./data/', help="Contains Pickle files")
-    parser.add_argument('--num_epochs', type=int, default=1000, help='Number of training epochs (default: 500)')
+    parser.add_argument('--num_epochs', type=int, default=500, help='Number of training epochs (default: 500)')
     parser.add_argument('--batch_size', type=int, default=8192, help='Batch size (default: 512)')
     parser.add_argument('--gamma', type=int, default=1, help='Tradeoff for Adversarial Penalty')
     parser.add_argument('--valid_freq', type=int, default=20, help='Validate frequency in epochs (default: 50)')
@@ -93,7 +93,6 @@ def parse_args():
     parser.add_argument('--dont_train', action='store_true', help='Dont Do Train Loop')
     parser.add_argument('--sample_mask', type=bool, default=False, help='Sample a binary mask for discriminators to use')
     parser.add_argument('--use_trained_filters', type=bool, default=False, help='Sample a binary mask for discriminators to use')
-    parser.add_argument('--decay_lr', type=str, default='halving_step100', help='lr decay mode')
     parser.add_argument('--optim_mode', type=str, default='adam', help='optimizer')
     parser.add_argument('--fairD_optim_mode', type=str, default='adam_hyp2',help='optimizer for Fairness Discriminator')
     parser.add_argument('--namestr', type=str, default='', help='additional info in output filename to help identify experiments')
@@ -145,9 +144,10 @@ def main(args):
     all_hash.update(set([r.tobytes() for r in test_set.dataset]))
 
     ''' Comet Logging '''
-    experiment = Experiment(api_key="Ht9lkWvTm58fRo9ccgpabq5zV",
-                        project_name="graph-fairness", workspace="joeybose")
+    experiment = Experiment(api_key="Ht9lkWvTm58fRo9ccgpabq5zV", disabled= not args.do_log
+                        ,project_name="graph-fairness", workspace="joeybose")
     experiment.set_name(args.namestr)
+
     modelD = TransD(args.num_ent, args.num_rel, args.embed_dim, args.p)
 
     ''' Initialize Everything to None '''
@@ -229,7 +229,6 @@ def main(args):
                 filter_.cuda()
 
     optimizerD = optimizer(modelD.parameters(), 'adam_sparse_hyp3', args.lr)
-    schedulerD = lr_scheduler(optimizerD, args.decay_lr, args.num_epochs)
 
     _cst_inds = torch.LongTensor(np.arange(args.num_ent, \
             dtype=np.int64)[:,None]).cuda().repeat(1, args.batch_size//2)
@@ -251,16 +250,9 @@ def main(args):
     if not args.dont_train:
         with experiment.train():
             for epoch in tqdm(range(1, args.num_epochs + 1)):
-                if args.do_log:
-                    experiment.log_current_epoch(epoch)
                 train(train_loader,epoch,args,train_hash,modelD,optimizerD,\
                         fairD_set,optimizer_fairD_set,filter_set,experiment)
                 gc.collect()
-                if args.decay_lr:
-                    if args.decay_lr == 'ReduceLROnPlateau':
-                        schedulerD.step(monitor['D_loss_epoch_avg'])
-                    else:
-                        schedulerD.step()
 
                 if epoch % args.valid_freq == 0:
                     with torch.no_grad():
@@ -287,8 +279,8 @@ def main(args):
                         test_fairness(test_set,args,modelD,experiment,\
                                 fairD_random,attribute='random', epoch=epoch)
 
-                    joblib.dump({'l_ranks':l_ranks, 'r_ranks':r_ranks},args.outname_base+\
-                            'epoch{}_validation_ranks.pkl'.format(epoch), compress=9)
+                    # joblib.dump({'l_ranks':l_ranks, 'r_ranks':r_ranks},args.outname_base+\
+                            # 'epoch{}_validation_ranks.pkl'.format(epoch), compress=9)
 
                     if args.do_log: # Tensorboard logging
                         experiment.log_metric("Mean Rank",float(avg_mr),step=epoch)
@@ -303,15 +295,6 @@ def main(args):
 
         l_ranks,r_ranks,avg_mr,avg_mrr,avg_h10,avg_h5 = test(test_set,args, all_hash, modelD)
         joblib.dump({'l_ranks':l_ranks, 'r_ranks':r_ranks}, args.outname_base+'test_ranks.pkl', compress=9)
-
-        ''' Testing Compositional Fairness '''
-        if args.sample_mask:
-            for i in range(0,10):
-                mask = np.random.choice([0, 1], size=(3,))
-                masked_filter_set = list(mask_fairDiscriminators(filter_set,mask))
-                attribute_names = list(mask_fairDiscriminators(['gender','occupation','age'],mask))
-                test_compositional_fairness(test_set,args,modelD,fairD_set,\
-                        filter_set,attribute_names,epoch=epoch)
 
         modelD.save(args.outname_base+'D_final.pts')
         if args.use_attr or args.use_gender_attr:
@@ -328,41 +311,97 @@ def main(args):
             occupation_filter.save(args.outname_base+'OccupationFilter.pts')
             age_filter.save(args.outname_base+'AgeFilter.pts')
 
-    if args.test_new_disc:
-        ''' Testing with fresh discriminators '''
-        args.freeze_transD = True
-        if args.sample_mask:
-            args.use_trained_filters = True
-            ''' Test With Filters '''
-            retrain_disc(args,train_loader,train_hash,test_set,modelD,\
-                    optimizerD,experiment,gender_filter,occupation_filter=None,\
-                    age_filter=None,attribute='gender')
-            retrain_disc(args,train_loader,train_hash,test_set,modelD,\
-                    optimizerD,experiment,occupation_filter=occupation_filter,\
-                    gender_filter=None,age_filter=None,attribute='occupation')
-            retrain_disc(args,train_loader,train_hash,test_set,modelD,\
-                    optimizerD,experiment,age_filter=age_filter,gender_filter=None,\
-                    occupation_filter=None,attribute='age')
+    ''' Training Fresh Discriminators'''
+    args.freeze_transD = True
+    new_fairD_gender = DemParDisc(args.embed_dim,attr_data,use_cross_entropy=args.use_cross_entropy)
+    new_fairD_gender.cuda()
+    new_optimizer_fairD_gender = optimizer(fairD_gender.parameters(),'adam', args.lr)
+    fairD_set = [new_fairD_gender,fairD_occupation,fairD_age,fairD_random]
+    optimizer_fairD_set = [new_optimizer_fairD_gender, optimizer_fairD_occupation,\
+            optimizer_fairD_age,optimizer_fairD_random]
+    freeze_model(modelD)
+    # ipdb.set_trace()
+    if not args.dont_train:
+        with experiment.test():
+            for epoch in tqdm(range(1, args.num_epochs + 1)):
+                train(train_loader,epoch,args,train_hash,modelD,optimizerD,\
+                        fairD_set,optimizer_fairD_set,filter_set,experiment)
+                gc.collect()
 
-        args.use_trained_filters = False
+                if epoch % args.valid_freq == 0:
+                    with torch.no_grad():
+                        l_ranks,r_ranks,avg_mr,avg_mrr,avg_h10,avg_h5 = test(test_set, args, all_hash,\
+                                modelD,subsample=10)
 
-        '''Test Without Filters '''
-        if args.use_attr or args.use_gender_attr:
-            retrain_disc(args,train_loader,train_hash,test_set,modelD,\
-                    optimizerD,experiment,gender_filter=None,\
-                    occupation_filter=None,age_filter=None,attribute='gender')
-        if args.use_attr or args.use_occ_attr:
-            retrain_disc(args,train_loader,train_hash,test_set,modelD,\
-                    optimizerD,experiment,gender_filter=None,\
-                    occupation_filter=None,age_filter=None,attribute='occupation')
-        if args.use_attr or args.use_age_attr:
-            retrain_disc(args,train_loader,train_hash,test_set,modelD,\
-                    optimizerD,experiment,gender_filter=None,\
-                    occupation_filter=None,age_filter=None,attribute='age')
-        if args.use_attr or args.use_random_attr:
-            retrain_disc(args,train_loader,train_hash,test_set,modelD,\
-                    optimizerD,experiment,gender_filter=None,\
-                    occupation_filter=None,age_filter=None,attribute='random')
+                    if args.use_attr:
+                        test_fairness(test_set,args,modelD,experiment,\
+                                fairD_gender, attribute='gender',epoch=epoch)
+                        test_fairness(test_set,args,modelD,experiment,\
+                                fairD_occupation,attribute='occupation', epoch=epoch)
+                        test_fairness(test_set,args,modelD,experiment,\
+                                fairD_age,attribute='age', epoch=epoch)
+                    elif args.use_gender_attr:
+                        test_fairness(test_set,args,modelD,experiment,\
+                                fairD_gender, attribute='gender',epoch=epoch)
+                    elif args.use_occ_attr:
+                        test_fairness(test_set,args,modelD,experiment,\
+                                fairD_occupation,attribute='occupation', epoch=epoch)
+                    elif args.use_age_attr:
+                        test_fairness(test_set,args,modelD,experiment,\
+                                fairD_age,attribute='age', epoch=epoch)
+                    elif args.use_random_attr:
+                        test_fairness(test_set,args,modelD,experiment,\
+                                fairD_random,attribute='random', epoch=epoch)
+
+                    if args.do_log: # Tensorboard logging
+                        experiment.log_metric("Mean Rank",float(avg_mr),step=epoch)
+                        experiment.log_metric("Mean Reciprocal Rank",\
+                                float(avg_mrr),step=epoch)
+                        experiment.log_metric("Hit @10",float(avg_h10),step=epoch)
+                        experiment.log_metric("Hit @5",float(avg_h5),step=epoch)
+
+                if epoch % (args.valid_freq * 5) == 0:
+                    l_ranks,r_ranks,avg_mr,avg_mrr,avg_h10,avg_h5 = test(test_set,args, all_hash,\
+                            modelD)
+
+    # if args.test_new_disc:
+        # ''' Testing with fresh discriminators '''
+        # args.freeze_transD = True
+        # load_modelD = TransD(args.num_ent, args.num_rel, args.embed_dim, args.p)
+        # load_modelD.load(args.outname_base+'D_final.pts')
+        # load_modelD.cuda()
+        # if args.sample_mask:
+            # args.use_trained_filters = True
+            # ''' Test With Filters '''
+            # retrain_disc(args,train_loader,train_hash,test_set,load_modelD,\
+                    # optimizerD,experiment,gender_filter,occupation_filter=None,\
+                    # age_filter=None,attribute='gender')
+            # retrain_disc(args,train_loader,train_hash,test_set,load_modelD,\
+                    # optimizerD,experiment,occupation_filter=occupation_filter,\
+                    # gender_filter=None,age_filter=None,attribute='occupation')
+            # retrain_disc(args,train_loader,train_hash,test_set,load_modelD,\
+                    # optimizerD,experiment,age_filter=age_filter,gender_filter=None,\
+                    # occupation_filter=None,attribute='age')
+
+        # args.use_trained_filters = False
+
+        # '''Test Without Filters '''
+        # if args.use_attr or args.use_gender_attr:
+            # retrain_disc(args,train_loader,train_hash,test_set,load_modelD,\
+                    # optimizerD,experiment,gender_filter=None,\
+                    # occupation_filter=None,age_filter=None,attribute='gender')
+        # if args.use_attr or args.use_occ_attr:
+            # retrain_disc(args,train_loader,train_hash,test_set,load_modelD,\
+                    # optimizerD,experiment,gender_filter=None,\
+                    # occupation_filter=None,age_filter=None,attribute='occupation')
+        # if args.use_attr or args.use_age_attr:
+            # retrain_disc(args,train_loader,train_hash,test_set,load_modelD,\
+                    # optimizerD,experiment,gender_filter=None,\
+                    # occupation_filter=None,age_filter=None,attribute='age')
+        # if args.use_attr or args.use_random_attr:
+            # retrain_disc(args,train_loader,train_hash,test_set,load_modelD,\
+                    # optimizerD,experiment,gender_filter=None,\
+                    # occupation_filter=None,age_filter=None,attribute='random')
         experiment.end()
 
 if __name__ == '__main__':
