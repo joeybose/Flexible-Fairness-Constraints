@@ -260,7 +260,7 @@ class DemParDisc(nn.Module):
             A_labels = A_labels.unsqueeze(1)
             if self.cross_entropy:
                 fair_penalty = F.binary_cross_entropy_with_logits(scores,\
-                        A_labels)
+                        A_labels,reduction='sum')
             else:
                 probs = torch.sigmoid(scores)
                 fair_penalty = F.l1_loss(probs,A_labels,reduction='elementwise_mean')
@@ -348,7 +348,7 @@ class FBDemParDisc(nn.Module):
         A_labels = A_labels.unsqueeze(1)
         if self.cross_entropy or force_ce:
             fair_penalty = F.binary_cross_entropy_with_logits(scores,\
-                    A_labels,weight=self.weights)
+                    A_labels)#,weight=self.weights)
         else:
             probs = torch.sigmoid(scores)
             fair_penalty = F.l1_loss(probs,A_labels,\

@@ -40,7 +40,7 @@ def make_dataset(load_sidechannel=False):
     if load_sidechannel:
         return train_ratings,test_ratings,users,movies
     else:
-        return train_ratings,test_ratings,
+        return train_ratings,test_ratings
 
 def make_dataset_1M(load_sidechannel=False):
     r_cols = ['user_id', 'movie_id', 'rating', 'unix_timestamp']
@@ -51,7 +51,7 @@ def make_dataset_1M(load_sidechannel=False):
     train_ratings = shuffled_ratings[:train_cutoff_row]
     test_ratings = shuffled_ratings[train_cutoff_row:]
     if load_sidechannel:
-        u_cols = ['user_id','gender','age','occupation','zip_code']
+        u_cols = ['user_id','sex','age','occupation','zip_code']
         m_cols = ['movie_id','title','genre']
         users = pd.read_csv('./ml-1m/users.dat', sep='::', names=u_cols,
                             encoding='latin-1', parse_dates=True)
@@ -69,11 +69,11 @@ def make_dataset_1M(load_sidechannel=False):
     movies.movie_id = movies.movie_id.astype(np.int64)
     users['user_id'] = users['user_id'] - 1
     movies['movie_id'] = movies['movie_id'] - 1
-    ipdb.set_trace()
 
     if load_sidechannel:
         return train_ratings,test_ratings,users,movies
     else:
-        return train_ratings,test_ratings,
+        return train_ratings,test_ratings
+
 if __name__ == '__main__':
     make_dataset_1M(True)
