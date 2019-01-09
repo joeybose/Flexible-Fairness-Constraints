@@ -47,7 +47,7 @@ def make_dataset_1M(load_sidechannel=False):
     ratings = pd.read_csv('./ml-1m/ratings.dat', sep='::', names=r_cols,
 			  encoding='latin-1')
     shuffled_ratings = ratings.sample(frac=1).reset_index(drop=True)
-    train_cutoff_row = int(np.round(len(shuffled_ratings)*0.8))
+    train_cutoff_row = int(np.round(len(shuffled_ratings)*0.9))
     train_ratings = shuffled_ratings[:train_cutoff_row]
     test_ratings = shuffled_ratings[train_cutoff_row:]
     if load_sidechannel:
@@ -75,5 +75,5 @@ def make_dataset_1M(load_sidechannel=False):
     else:
         return train_ratings,test_ratings
 
-if __name__ == '__main__':
-    make_dataset_1M(True)
+# if __name__ == '__main__':
+    # make_dataset_1M(True)

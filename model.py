@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import shutil
+import math
 import torch.optim as optim
 from torch.autograd import Variable
 from torch.utils.data import Dataset, DataLoader
@@ -50,7 +51,7 @@ class TransE(nn.Module):
         self.ent_embeds.weight.data.uniform_(-r, r)#.renorm_(p=2, dim=1, maxnorm=1)
         self.rel_embeds.weight.data.uniform_(-r, r)#.renorm_(p=2, dim=1, maxnorm=1)
 
-    def forward(self, triplets):
+    def forward(self, triplets, return_ent_emb=False):
 
         lhs_idxs = triplets[:, 0]
         rel_idxs = triplets[:, 1]
@@ -60,7 +61,17 @@ class TransE(nn.Module):
         rhs_es = self.ent_embeds(rhs_idxs)
 
         enrgs = (lhs_es + rel_es - rhs_es).norm(p=self.p, dim=1)
+        if not return_ent_emb:
+            enrgs = (lhs_es + rel_es - rhs_es).norm(p=self.p, dim=1)
+            return enrgs
+        else:
+            enrgs = (lhs_es + rel_es - rhs_es).norm(p=self.p, dim=1)
+            return enrgs,lhs_es,rhs_es,rel_es
         return enrgs
+
+    def get_embed(self, ents, rel_idxs=None):
+        ent_embed = self.ent_embeds(ents)
+        return ent_embed
 
     def save(self, fn):
         torch.save(self.state_dict(), fn)
@@ -209,8 +220,104 @@ class AttributeFilter(nn.Module):
         self.loaded = True
         self.load_state_dict(torch.load(fn))
 
+class BilinearDecoder(nn.Module):
+    """
+    Decoder where the relationship score is given by a bilinear form
+    between the embeddings (i.e., one learned matrix per relationship type).
+    """
+
+    def __init__(self, num_relations, embed_dim):
+        super(BilinearDecoder, self).__init__()
+        self.rel_embeds = nn.Embedding(num_relations, embed_dim*embed_dim)
+        self.embed_dim = embed_dim
+
+    def forward(self, embeds1, embeds2, rels):
+        rel_mats = self.rel_embeds(rels).reshape(-1, self.embed_dim, self.embed_dim)
+        embeds1 = torch.matmul(embeds1, rel_mats)
+        return (embeds1 * embeds2).sum(dim=1)
+
+class SharedBilinearDecoder(nn.Module):
+    """
+    Decoder where the relationship score is given by a bilinear form
+    between the embeddings (i.e., one learned matrix per relationship type).
+    """
+
+    def __init__(self, num_relations, num_weights, embed_dim):
+        super(SharedBilinearDecoder, self).__init__()
+        self.rel_embeds = nn.Embedding(num_weights, embed_dim*embed_dim)
+        self.weight_scalars = nn.Parameter(torch.Tensor(num_weights,num_relations))
+        stdv = 1. / math.sqrt(self.weight_scalars.size(1))
+        self.weight_scalars.data.uniform_(-stdv, stdv)
+        self.embed_dim = embed_dim
+        self.num_weights = num_weights
+        self.num_relations = num_relations
+        self.nll = nn.NLLLoss()
+        self.mse = nn.MSELoss()
+
+    def forward(self, embeds1, embeds2, rels):
+        basis_outputs = []
+        for i in range(0,self.num_weights):
+            index = Variable(torch.LongTensor([i])).cuda()
+            rel_mat = self.rel_embeds(index).reshape(self.embed_dim,\
+                    self.embed_dim)
+            u_Q = torch.matmul(embeds1, rel_mat)
+            u_Q_v = (u_Q*embeds2).sum(dim=1)
+            basis_outputs.append(u_Q_v)
+        basis_outputs = torch.stack(basis_outputs,dim=1)
+        logit = torch.matmul(basis_outputs,self.weight_scalars)
+        outputs = F.log_softmax(logit,dim=1)
+        log_probs = torch.gather(outputs,1,rels.unsqueeze(1))
+        loss = self.nll(outputs,rels)
+        preds = 0
+        for j in range(0,self.num_relations):
+            index = Variable(torch.LongTensor([j])).cuda()
+            ''' j+1 because of zero index '''
+            preds += (j+1)*torch.exp(torch.index_select(outputs, 1,index))
+        # rels = rels + 1
+        # loss = torch.sqrt(self.mse(preds.squeeze(),rels.float()))
+        return loss,preds
+
+class SimpleGCMC(nn.Module):
+    def __init__(self, decoder, embed_dim, num_ent, p , encoder=None, attr_filter=None):
+        super(SimpleGCMC, self).__init__()
+        self.attr_filter = attr_filter
+        self.decoder = decoder
+        self.num_ent = num_ent
+        self.embed_dim = embed_dim
+        self.batchnorm = nn.BatchNorm1d(self.embed_dim)
+        self.p = p
+        if encoder is None:
+            r = 6 / np.sqrt(self.embed_dim)
+            self.encoder = nn.Embedding(self.num_ent, self.embed_dim,\
+                    max_norm=1, norm_type=2)
+            self.encoder.weight.data.uniform_(-r, r).renorm_(p=2, dim=1, maxnorm=1)
+        else:
+            self.encoder = encoder
+
+    def encode(self, nodes):
+        # return self.attr_filter(self.embeddings(nodes), active_attrs)
+        embs = self.encoder(nodes)
+        embs = self.batchnorm(embs)
+        return embs
+
+    def forward(self, pos_edges, weights=None, return_embeds=False):
+        pos_head_embeds = self.encode(pos_edges[:,0])
+        pos_tail_embeds = self.encode(pos_edges[:,-1])
+        rels = pos_edges[:,1]
+        loss, preds = self.decoder(pos_head_embeds, pos_tail_embeds, rels)
+        if return_embeds:
+            return loss, preds, pos_head_embeds, pos_tail_embeds
+        else:
+            return loss, preds
+
+    def save(self, fn):
+        torch.save(self.state_dict(), fn)
+
+    def load(self, fn):
+        self.load_state_dict(torch.load(fn))
+
 class DemParDisc(nn.Module):
-    def __init__(self, embed_dim, attribute_data,attribute='gender',use_cross_entropy=True):
+    def __init__(self, use_1M,  embed_dim, attribute_data,attribute='gender',use_cross_entropy=True):
         super(DemParDisc, self).__init__()
         self.embed_dim = int(embed_dim)
         self.attribute_data = attribute_data
@@ -239,10 +346,16 @@ class DemParDisc(nn.Module):
         else:
             users_age = attribute_data[0]['age'].values
             users_age_list = sorted(set(users_age))
-            bins = np.linspace(5, 75, num=15, endpoint=True)
-            inds = np.digitize(users_age, bins) - 1
-            self.users_sensitive = np.ascontiguousarray(inds)
-            self.out_dim = len(bins)
+            if not use_1M:
+                bins = np.linspace(5, 75, num=15, endpoint=True)
+                inds = np.digitize(users_age, bins) - 1
+                self.users_sensitive = np.ascontiguousarray(inds)
+                self.out_dim = len(bins)
+            else:
+                reindex = {1:0, 18:1, 25:2, 35:3, 45:4, 50:5, 56:6}
+                inds = [reindex.get(n, n) for n in users_age]
+                self.users_sensitive = np.ascontiguousarray(inds)
+                self.out_dim = 7
 
         self.W1 = nn.Linear(self.embed_dim, int(self.embed_dim * 2), bias=True)
         self.W2 = nn.Linear(int(self.embed_dim * 2), int(self.embed_dim), bias=True)
@@ -260,7 +373,7 @@ class DemParDisc(nn.Module):
             A_labels = A_labels.unsqueeze(1)
             if self.cross_entropy:
                 fair_penalty = F.binary_cross_entropy_with_logits(scores,\
-                        A_labels,reduction='sum')
+                        A_labels)
             else:
                 probs = torch.sigmoid(scores)
                 fair_penalty = F.l1_loss(probs,A_labels,reduction='elementwise_mean')

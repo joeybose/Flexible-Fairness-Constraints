@@ -80,6 +80,7 @@ def main():
     test_data = parse_file(test_file)
     ent_to_idx, attr_to_idx = get_idx_dicts(train_data + valid_data + test_data)
 
+    ipdb.set_trace()
     ''' Count attributes '''
     train_attr_count = count_attributes(train_data, attr_to_idx)
     valid_attr_count = count_attributes(valid_data, attr_to_idx)
@@ -92,7 +93,6 @@ def main():
             train_reindex_attr_idx, attribute_mat)
 
     pickle.dump(attribute_mat, open('./data/Attributes_%s-train.pkl' % args.dataset, 'wb'), protocol=-1)
-
     json.dump(ent_to_idx, open('./data/Attributes_%s-ent_to_idx.json' % args.dataset, 'w'))
     json.dump(attr_to_idx, open('./data/Attributes_%s-attr_to_idx.json' % args.dataset, 'w'))
     json.dump(train_reindex_attr_idx, open('./data/Attributes_%s-reindex_attr_to_idx.json' % args.dataset, 'w'))

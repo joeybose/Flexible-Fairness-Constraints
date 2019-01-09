@@ -1,3 +1,5 @@
+import torch
+
 def compute_rank(enrgs, target, mask_observed=None):
     enrg = enrgs[target]
     if mask_observed is not None:
@@ -18,3 +20,10 @@ def create_or_append(d, k, v, v2np=None):
             d[k].append(v2np(v))
         else:
             d[k] = [v2np(v)]
+
+def to_multi_gpu(model):
+    cuda_stat = torch.cuda.is_available()
+    if cuda_stat:
+        model = torch.nn.DataParallel(model,\
+                device_ids=range(torch.cuda.device_count())).cuda()
+    return model
