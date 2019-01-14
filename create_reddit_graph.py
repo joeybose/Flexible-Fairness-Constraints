@@ -3,6 +3,7 @@ import pickle
 import json
 import logging
 import sys, os
+import ipdb
 import subprocess
 from tqdm import tqdm
 import concurrent.futures
@@ -14,7 +15,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--filedir',type=str,default='./reddit_data/Reddit_split_2017-11/split_csv/',\
             help='Reddit dump')
-    parser.add_argument('--k_core', type=int, default=5, help="K-core for Graph")
+    parser.add_argument('--k_core', type=int, default=10, help="K-core for Graph")
     parser.add_argument('--fileprefix', type=str,\
             default='Split_RC_2017-11*', help='Split Prefix Reddit dump')
     parser.add_argument('--save_dir_prefix', type=str,\
@@ -45,21 +46,27 @@ def process_csv(filename):
     return G
 
 def main(args):
-    file_paths = args.filedir + args.fileprefix
-    split_files = glob.glob(file_paths)
-    G_list = []
-    with concurrent.futures.ProcessPoolExecutor() as executor:
-        for file_, sub_G in tqdm(zip(split_files,executor.map(process_csv,split_files)),total=len(split_files)):
-            print("Split file %s" %(file_))
-            G_list.append(sub_G)
     save_path_base = "./reddit_data/Reddit_split_2017-11/split_csv/"
-    master_G = nx.compose_all(G_list)
     save_path_master = save_path_base + args.save_master
-    nx.write_gpickle(master_G,save_path_master)
+    ipdb.set_trace()
+    if  os.path.isfile(save_path_master):
+        master_G = nx.read_gpickle(save_path_master)
+    else:
+        file_paths = args.filedir + args.fileprefix
+        split_files = glob.glob(file_paths)
+        G_list = []
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            for file_, sub_G in tqdm(zip(split_files,executor.map(process_csv,split_files)),total=len(split_files)):
+                print("Split file %s" %(file_))
+                G_list.append(sub_G)
+        save_path_base = "./reddit_data/Reddit_split_2017-11/split_csv/"
+        master_G = nx.compose_all(G_list)
+        nx.write_gpickle(master_G,save_path_master)
     print("Created Master Graph")
     master_G_k_core = nx.k_core(master_G, k=args.k_core)
     print("K-core of Master Graph")
-    save_path_k_core = save_path_base + args.save_master_k_core
+    save_path_k_core = save_path_base + str(args.k_core) + \
+            '_' + args.save_master_k_core
     nx.write_gpickle(master_G_k_core,save_path_k_core)
 
 if __name__ == '__main__':

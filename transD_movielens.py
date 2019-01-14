@@ -94,7 +94,6 @@ def freeze_model(model):
         params.requires_grad = False
 
 def roc_auc_score_multiclass(actual_class, pred_class, average = "macro"):
-
     #creating a set of all the unique classes using the actual class list
     unique_class = set(actual_class)
     roc_auc_dict = {}
@@ -175,26 +174,16 @@ def mask_fairDiscriminators(discriminators, mask):
     # compress('ABCDEF', [1,0,1,0,1,1]) --> A C E F
     return (d for d, s in zip(discriminators, mask) if s)
 
-def apply_filters_gcmc(args,p_lhs_emb,p_rhs_emb,nce_lhs_emb,nce_rhs_emb,\
-        rel_emb,p_batch_var,nce_batch,d_outs):
+def apply_filters_gcmc(args,p_lhs_emb,masked_filter_set):
     ''' Doesnt Have Masked Filters yet '''
     filter_l_emb, filter_r_emb = 0,0
-    filter_nce_l_emb, filter_nce_r_emb = 0,0
     if args.sample_mask:
         for filter_ in masked_filter_set:
             if filter_ is not None:
                 filter_l_emb += filter_(p_lhs_emb)
-                filter_r_emb += filter_(p_rhs_emb)
-                filter_nce_l_emb += filter_(nce_lhs_emb)
-                filter_nce_r_emb += filter_(nce_rhs_emb)
-        p_enrgs = (filter_l_emb + rel_emb[:len(p_batch_var)] -\
-                filter_r_emb).norm(p=self.p, dim=1)
-        nce_enrgs = (filter_nce_l_emb + rel_emb[len(p_batch_var):(len(p_batch_var)+len(nce_batch))] -\
-                filter_nce_r_emb).norm(p=self.p, dim=1)
     else:
         filter_l_emb = p_lhs_emb
-        filter_r_emb = p_rhs_emb
-    return filter_l_emb,filter_r_emb
+    return filter_l_emb
 
 def apply_filters_nce(args,p_lhs_emb,p_rhs_emb,nce_lhs_emb,nce_rhs_emb,\
         rel_emb,p_batch_var,nce_batch,d_outs):
@@ -221,60 +210,6 @@ def apply_filters_nce(args,p_lhs_emb,p_rhs_emb,nce_lhs_emb,nce_rhs_emb,\
         nce_enrgs = d_outs[len(p_batch_var):(len(p_batch_var)+len(nce_batch))]
 
     return p_enrgs, nce_enrgs, filter_l_emb
-
-def train_classifier(data_loader, counter, args, modelD,\
-        fairD_set, optimizer_fairD_set, experiment):
-
-    fairD_gender_loss,fairD_occupation_loss,fairD_age_loss,\
-            fairD_random_loss = 0,0,0,0
-
-    if args.show_tqdm:
-        data_itr = tqdm(enumerate(data_loader))
-    else:
-        data_itr = enumerate(data_loader)
-
-    for idx, batch in data_itr:
-        l_batch = Variable(batch).cuda()
-        lhs_emb = modelD.get_embed(l_batch,rel_batch)
-
-        if filter_ is not None:
-            lhs_emb = filter_(lhs_emb)
-
-        l_preds,l_A_labels,probs = fairD.predict(lhs_emb,lhs,return_preds=True)
-        l_correct = l_preds.eq(l_A_labels.view_as(l_preds)).sum().item()
-        if attribute == 'gender':
-            l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
-                    average='binary')
-        else:
-            l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
-                    average='micro')
-
-        precision = l_precision
-        recall = l_recall
-        fscore = l_fscore
-        precision_list.append(precision)
-        recall_list.append(recall)
-        fscore_list.append(fscore)
-        preds_list.append(probs)
-        labels_list.append(l_A_labels.view_as(l_preds))
-        correct += l_correct
-        total_ent += len(lhs_emb)
-
-    if args.do_log:
-        acc = 100. * correct / total_ent
-        mean_precision = np.mean(np.asarray(precision_list))
-        mean_recall = np.mean(np.asarray(recall_list))
-        mean_fscore = np.mean(np.asarray(fscore_list))
-        preds_list = torch.cat(preds_list,0).data.cpu().numpy()
-        labels_list = torch.cat(labels_list,0).data.cpu().numpy()
-        if retrain:
-            attribute = 'Retrained_D_' + attribute
-        experiment.log_metric(attribute + "_Valid FairD Accuracy",float(acc),step=epoch)
-        print('Valid Accuracy is %f' %(float(acc)))
-        if attribute == 'gender' or attribute == 'random':
-            AUC = roc_auc_score(labels_list, preds_list)
-            print('Valid AUC is %f' %(float(AUC)))
-            experiment.log_metric(attribute + "_Valid FairD AUC",float(AUC),step=epoch)
 
 def train_nce(data_loader,counter,args,train_hash,modelD,optimizerD,\
         fairD_set, optimizer_fairD_set, filter_set, experiment):
@@ -313,7 +248,7 @@ def train_nce(data_loader,counter,args,train_hash,modelD,optimizerD,\
             else:
                 nce_np = nce_batch.numpy()
 
-            nce_falseNs = ftensor(np.array([int(x.tobytes() in train_hash) for x in nce_np], dtype=np.float32))
+            nce_falseNs = torch.FloatTensor(np.array([int(x.tobytes() in train_hash) for x in nce_np], dtype=np.float32))
             nce_falseNs = Variable(nce_falseNs.cuda()) if args.use_cuda else Variable(nce_falseNs)
         else:
             nce_falseNs = None
@@ -346,14 +281,7 @@ def train_nce(data_loader,counter,args,train_hash,modelD,optimizerD,\
             ''' Apply Discriminators '''
             for fairD_disc, fair_optim in zip(masked_fairD_set,masked_optimizer_fairD_set):
                 if fairD_disc is not None and fair_optim is not None:
-                    # fair_optim.zero_grad()
-                    l_penalty += fairD_disc(filter_l_emb,p_batch[:,0])
-                    # if not args.use_cross_entropy:
-                        # fairD_loss = -1*(1 - l_penalty)
-                    # else:
-                        # fairD_loss = l_penalty
-                    # fairD_loss.backward(retain_graph=False)
-                    # fair_optim.step()
+                    l_penalty += fairD_disc(filter_l_emb,p_batch[:,0],True)
 
             if not args.use_cross_entropy:
                 fair_penalty = constant - l_penalty
@@ -364,7 +292,7 @@ def train_nce(data_loader,counter,args,train_hash,modelD,optimizerD,\
                 optimizerD.zero_grad()
                 nce_term, nce_term_scores = loss_func(p_enrgs, nce_enrgs, weights=(1.-nce_falseNs))
                 lossD = nce_term + args.gamma*fair_penalty
-                lossD.backward(retain_graph=False)
+                lossD.backward(retain_graph=True)
                 optimizerD.step()
 
             l_penalty_2 = 0
@@ -372,12 +300,12 @@ def train_nce(data_loader,counter,args,train_hash,modelD,optimizerD,\
                     masked_optimizer_fairD_set):
                 if fairD_disc is not None and fair_optim is not None:
                     fair_optim.zero_grad()
-                    l_penalty_2 += fairD_disc(filter_l_emb.detach(),p_batch[:,0])
+                    l_penalty_2 += fairD_disc(filter_l_emb.detach(),p_batch[:,0],True)
                     if not args.use_cross_entropy:
                         fairD_loss = -1*(1 - l_penalty_2)
                     else:
                         fairD_loss = l_penalty_2
-                    fairD_loss.backward(retain_graph=False)
+                    fairD_loss.backward(retain_graph=True)
                     fair_optim.step()
 
         else:
@@ -414,7 +342,7 @@ def train_nce(data_loader,counter,args,train_hash,modelD,optimizerD,\
                                     filter_emb += filter_(p_lhs_emb)
                         else:
                             filter_emb = p_lhs_emb
-                        l_preds, l_A_labels, probs = fairD_disc.predict(filter_emb,p_batch[:,0],return_preds=True)
+                        probs, l_A_labels, l_preds = fairD_disc.predict(filter_emb,p_batch[:,0],True)
                         l_correct = l_preds.eq(l_A_labels.view_as(l_preds)).sum().item()
                         if fairD_disc.attribute == 'gender':
                             fairD_gender_loss = fairD_loss.detach().cpu().numpy()
@@ -487,18 +415,17 @@ def train_gcmc(data_loader,counter,args,train_hash,modelD,optimizerD,\
         if constant != 0:
             task_loss,preds,lhs_emb,rhs_emb = modelD(p_batch_var,return_embeds=True)
             p_lhs_emb = lhs_emb[:len(p_batch_var)]
-            p_rhs_emb = rhs_emb[:len(p_batch_var)]
+            # p_rhs_emb = rhs_emb[:len(p_batch_var)]
             l_penalty = 0
 
             ''' Apply Filter or Not to Embeddings '''
-            filter_l_emb,filter_r_emb = apply_filters_gcmc(args,p_lhs_emb,p_rhs_emb,None,\
-                    None,None,p_batch_var,nce_batch,d_outs)
+            filter_l_emb = apply_filters_gcmc(args,p_lhs_emb,masked_filter_set)
             # filter_l_emb = p_lhs_emb
 
             ''' Apply Discriminators '''
             for fairD_disc, fair_optim in zip(masked_fairD_set,masked_optimizer_fairD_set):
                 if fairD_disc is not None and fair_optim is not None:
-                    l_penalty += fairD_disc(filter_l_emb,p_batch[:,0])
+                    l_penalty += fairD_disc(filter_l_emb,p_batch[:,0],True)
 
             if not args.use_cross_entropy:
                 fair_penalty = constant - l_penalty
@@ -508,7 +435,7 @@ def train_gcmc(data_loader,counter,args,train_hash,modelD,optimizerD,\
             if not args.freeze_transD:
                 optimizerD.zero_grad()
                 full_loss = task_loss + args.gamma*fair_penalty
-                full_loss.backward(retain_graph=False)
+                full_loss.backward(retain_graph=True)
                 optimizerD.step()
 
             l_penalty_2 = 0
@@ -516,12 +443,13 @@ def train_gcmc(data_loader,counter,args,train_hash,modelD,optimizerD,\
                     masked_optimizer_fairD_set):
                 if fairD_disc is not None and fair_optim is not None:
                     fair_optim.zero_grad()
-                    l_penalty_2 += fairD_disc(filter_l_emb.detach(),p_batch[:,0])
+                    l_penalty_2 += fairD_disc(filter_l_emb.detach(),\
+                            p_batch[:,0],True)
                     if not args.use_cross_entropy:
                         fairD_loss = -1*(1 - l_penalty_2)
                     else:
                         fairD_loss = l_penalty_2
-                    fairD_loss.backward(retain_graph=False)
+                    fairD_loss.backward(retain_graph=True)
                     fair_optim.step()
 
         else:
@@ -555,7 +483,7 @@ def train_gcmc(data_loader,counter,args,train_hash,modelD,optimizerD,\
                                     filter_emb += filter_(p_lhs_emb)
                         else:
                             filter_emb = p_lhs_emb
-                        l_preds, l_A_labels, probs = fairD_disc.predict(filter_emb,p_batch[:,0],return_preds=True)
+                        probs, l_A_labels, l_preds = fairD_disc.predict(filter_emb,p_batch[:,0],True)
                         l_correct = l_preds.eq(l_A_labels.view_as(l_preds)).sum().item()
                         if fairD_disc.attribute == 'gender':
                             fairD_gender_loss = fairD_loss.detach().cpu().numpy()
@@ -603,124 +531,3 @@ def train(data_loader, counter, args, train_hash, modelD, optimizerD,\
         train_nce(data_loader,counter,args,train_hash,modelD,optimizerD,\
                 fairD_set, optimizer_fairD_set, filter_set, experiment)
 
-def retrain_disc(args,train_loader,train_hash,test_set,modelD,optimizerD,\
-        experiment,gender_filter,occupation_filter,age_filter,attribute):
-
-    if args.use_trained_filters:
-        print("Retrain New Discriminator with Filter on %s" %(attribute))
-    else:
-        print("Retrain New Discriminator on %s" %(attribute))
-
-    ''' Reset some flags '''
-    new_fairD_gender,new_fairD_occupation,new_fairD_age,new_fairD_random = None,None,None,None
-    new_optimizer_fairD_gender,new_optimizer_fairD_occupation,\
-            new_optimizer_fairD_age,new_optimizer_fairD_random = None,None,None,None
-
-    if attribute == 'gender':
-        args.use_gender_attr = True
-        args.use_occ_attr = False
-        args.use_age_attr = False
-        args.use_random_attr = False
-        args.use_attr = False
-    elif attribute =='occupation':
-        args.use_gender_attr = False
-        args.use_occ_attr = True
-        args.use_age_attr = False
-        args.use_random_attr = False
-        args.use_attr = False
-    elif attribute =='age':
-        args.use_gender_attr = False
-        args.use_occ_attr = False
-        args.use_age_attr = True
-        args.use_random_attr = False
-        args.use_attr = False
-    elif attribute =='random':
-        args.use_gender_attr = False
-        args.use_occ_attr = False
-        args.use_age_attr = False
-        args.use_random_attr = True
-        args.use_attr = False
-    else:
-        args.use_gender_attr = False
-        args.use_occ_attr = False
-        args.use_age_attr = False
-        args.use_random_attr = False
-        args.use_attr = True
-
-    '''Retrain Discriminator on Frozen TransD Model '''
-    if args.use_occ_attr:
-        attr_data = [args.users,args.movies]
-        new_fairD_occupation = DemParDisc(args.embed_dim,attr_data,\
-                attribute='occupation',use_cross_entropy=args.use_cross_entropy)
-        new_fairD_occupation.cuda()
-        new_optimizer_fairD_occupation = optimizer(new_fairD_occupation.parameters(),'adam',args.lr)
-        fairD_disc = new_fairD_occupation
-        fair_optim = new_optimizer_fairD_occupation
-    elif args.use_gender_attr:
-        attr_data = [args.users,args.movies]
-        new_fairD_gender = DemParDisc(args.embed_dim,attr_data,use_cross_entropy=args.use_cross_entropy)
-        new_optimizer_fairD_gender = optimizer(new_fairD_gender.parameters(),'adam',args.lr)
-        new_fairD_gender.cuda()
-        fairD_disc = new_fairD_gender
-        fair_optim = new_optimizer_fairD_gender
-    elif args.use_age_attr:
-        attr_data = [args.users,args.movies]
-        new_fairD_age = DemParDisc(args.embed_dim,attr_data,\
-            attribute='age',use_cross_entropy=args.use_cross_entropy)
-        new_optimizer_fairD_age = optimizer(new_fairD_age.parameters(),'adam',args.lr)
-        new_fairD_age.cuda()
-        fairD_disc = new_fairD_age
-        fair_optim = new_optimizer_fairD_age
-    elif args.use_random_attr:
-        attr_data = [args.users,args.movies]
-        new_fairD_random = DemParDisc(args.embed_dim,attr_data,\
-                attribute='random',use_cross_entropy=args.use_cross_entropy)
-        new_optimizer_fairD_random = optimizer(new_fairD_random.parameters(),'adam',args.lr)
-        new_fairD_random.cuda()
-        fairD_disc = new_fairD_random
-        fair_optim = new_optimizer_fairD_random
-
-    attr_data = [args.users,args.movies]
-    new_fairD_set = [new_fairD_gender,new_fairD_occupation,new_fairD_age,new_fairD_random]
-    new_optimizer_fairD_set = [new_optimizer_fairD_gender,new_optimizer_fairD_occupation,\
-            new_optimizer_fairD_age,new_optimizer_fairD_random]
-    if args.use_trained_filters:
-        filter_set = [gender_filter,occupation_filter,age_filter,None]
-    else:
-        filter_set = [None,None,None,None]
-
-    ''' Freeze Model + Filters '''
-    for filter_ in filter_set:
-        if filter_ is not None:
-            freeze_model(filter_)
-    # freeze_model(modelD)
-
-    with experiment.test():
-        for epoch in tqdm(range(1, args.num_epochs + 1)):
-            train(train_loader,epoch,args,train_hash,modelD,optimizerD,\
-                    new_fairD_set,new_optimizer_fairD_set,filter_set,experiment)
-            gc.collect()
-            if epoch % args.valid_freq == 0:
-                if args.use_attr:
-                    test_fairness(test_set,args, modelD,experiment,\
-                            new_fairD_gender, attribute='gender',epoch=epoch,\
-                            retrain=True)
-                    test_fairness(test_set,args,modelD,experiment,\
-                            new_fairD_occupation,attribute='occupation',epoch=epoch,\
-                            retrain=True)
-                    test_fairness(test_set,args, modelD,experiment,\
-                            new_fairD_age,attribute='age',epoch=epoch,retrain=True)
-                elif args.use_gender_attr:
-                    test_fairness(test_set,args,modelD,experiment,\
-                            new_fairD_gender, attribute='gender',epoch=epoch,\
-                            retrain=True)
-                elif args.use_occ_attr:
-                    test_fairness(test_set,args,modelD,experiment,\
-                            new_fairD_occupation,attribute='occupation',epoch=epoch,\
-                            retrain=True)
-                elif args.use_age_attr:
-                    test_fairness(test_set,args,modelD,experiment,\
-                            new_fairD_age,attribute='age',epoch=epoch,retrain=True)
-                elif args.use_random_attr:
-                    test_fairness(test_set,args,modelD,experiment,\
-                            new_fairD_random,attribute='random',epoch=epoch,retrain=True)

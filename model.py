@@ -36,6 +36,48 @@ ltensor = torch.LongTensor
 v2np = lambda v: v.data.cpu().numpy()
 USE_SPARSE_EMB = True
 
+class RedditEncoder(nn.Module):
+    def __init__(self, num_users, num_sr, embed_dim, p):
+        super(RedditEncoder, self).__init__()
+        self.num_users = num_users
+        self.num_sr = num_sr
+        self.embed_dim = embed_dim
+        self.p = p
+
+        r = 6 / np.sqrt(self.embed_dim)
+        self.user_embeds = nn.Embedding(self.num_users,self.embed_dim, \
+                max_norm=1, norm_type=2, sparse=USE_SPARSE_EMB)
+        self.sr_embeds = nn.Embedding(self.num_sr,self.embed_dim, \
+                max_norm=1, norm_type=2, sparse=USE_SPARSE_EMB)
+
+        self.user_embeds.weight.data.uniform_(-r, r)#.renorm_(p=2, dim=1, maxnorm=1)
+        self.sr_embeds.weight.data.uniform_(-r, r)#.renorm_(p=2, dim=1, maxnorm=1)
+
+    def forward(self, batch, return_ent_emb=False):
+        users, sr = batch[:,0],batch[:,1]
+        users_embed, sr_embed = self.encode(users,sr)
+        enrgs = (users_embed*sr_embed).sum(dim=1)
+        if not return_ent_emb:
+            return enrgs
+        else:
+            return enrgs,users_embed,sr_embed
+
+    def get_embed(self, users, sr):
+        user_embed = self.user_embeds(users)
+        sr_embed = self.sr_embeds(sr)
+        return user_embed, sr_embed
+
+    def encode(self, users, sr):
+        user_embed = self.user_embeds(users)
+        sr_embed = self.sr_embeds(sr)
+        return user_embed, sr_embed
+
+    def save(self, fn):
+        torch.save(self.state_dict(), fn)
+
+    def load(self, fn):
+        self.load_state_dict(torch.load(fn))
+
 class TransE(nn.Module):
     def __init__(self, num_ent, num_rel, embed_dim, p):
         super(TransE, self).__init__()
@@ -72,6 +114,26 @@ class TransE(nn.Module):
     def get_embed(self, ents, rel_idxs=None):
         ent_embed = self.ent_embeds(ents)
         return ent_embed
+
+    def encode(self, ents):
+        ent_embed = self.ent_embeds(ents)
+        return ent_embed
+
+    def predict(self,embeds1,embeds2):
+        energs_list = []
+        for i in range(0,self.num_weights):
+            index = Variable(torch.LongTensor([i)).cuda()
+            rel_es = self.rel_embeds(index)
+            enrgs = (embeds1 + rel_es - embeds2).norm(p=self.p, dim=1)
+            energs_list.append(enrgs)
+        enrgs_outputs = torch.stack(energs_list,dim=1)
+        outputs = F.log_softmax(enrgs_outputs,dim=1)
+        preds = 0
+        for j in range(0,self.num_relations):
+            index = Variable(torch.LongTensor([j])).cuda()
+            ''' j+1 because of zero index '''
+            preds += (j+1)*torch.exp(torch.index_select(outputs, 1,index))
+        return preds
 
     def save(self, fn):
         torch.save(self.state_dict(), fn)
@@ -254,6 +316,25 @@ class SharedBilinearDecoder(nn.Module):
         self.nll = nn.NLLLoss()
         self.mse = nn.MSELoss()
 
+    def predict(self,embeds1,embeds2):
+        basis_outputs = []
+        for i in range(0,self.num_weights):
+            index = Variable(torch.LongTensor([i])).cuda()
+            rel_mat = self.rel_embeds(index).reshape(self.embed_dim,\
+                    self.embed_dim)
+            u_Q = torch.matmul(embeds1, rel_mat)
+            u_Q_v = (u_Q*embeds2).sum(dim=1)
+            basis_outputs.append(u_Q_v)
+        basis_outputs = torch.stack(basis_outputs,dim=1)
+        logit = torch.matmul(basis_outputs,self.weight_scalars)
+        outputs = F.log_softmax(logit,dim=1)
+        preds = 0
+        for j in range(0,self.num_relations):
+            index = Variable(torch.LongTensor([j])).cuda()
+            ''' j+1 because of zero index '''
+            preds += (j+1)*torch.exp(torch.index_select(outputs, 1,index))
+        return preds
+
     def forward(self, embeds1, embeds2, rels):
         basis_outputs = []
         for i in range(0,self.num_weights):
@@ -273,8 +354,6 @@ class SharedBilinearDecoder(nn.Module):
             index = Variable(torch.LongTensor([j])).cuda()
             ''' j+1 because of zero index '''
             preds += (j+1)*torch.exp(torch.index_select(outputs, 1,index))
-        # rels = rels + 1
-        # loss = torch.sqrt(self.mse(preds.squeeze(),rels.float()))
         return loss,preds
 
 class SimpleGCMC(nn.Module):
@@ -300,6 +379,14 @@ class SimpleGCMC(nn.Module):
         embs = self.batchnorm(embs)
         return embs
 
+    def predict_rel(self,heads,tails_embed,filter_=None):
+        with torch.no_grad():
+            head_embeds = self.encode(heads)
+            if filter_ is not None:
+                head_embeds = filter_(pos_head_embeds)
+            preds = self.decoder.predict(head_embeds,tail_embeds)
+        return preds
+
     def forward(self, pos_edges, weights=None, return_embeds=False):
         pos_head_embeds = self.encode(pos_edges[:,0])
         pos_tail_embeds = self.encode(pos_edges[:,-1])
@@ -314,6 +401,296 @@ class SimpleGCMC(nn.Module):
         torch.save(self.state_dict(), fn)
 
     def load(self, fn):
+        self.load_state_dict(torch.load(fn))
+
+class GenderDiscriminator(nn.Module):
+    def __init__(self,use_1M,embed_dim,attribute_data,attribute,use_cross_entropy=True):
+        super(GenderDiscriminator, self).__init__()
+        self.embed_dim = int(embed_dim)
+        self.attribute_data = attribute_data
+        self.attribute = attribute
+        if use_cross_entropy:
+            self.cross_entropy = True
+        else:
+            self.cross_entropy = False
+
+        users_sex = attribute_data[0]['sex']
+        users_sex = [0 if i == 'M' else 1 for i in users_sex]
+        self.users_sensitive = np.ascontiguousarray(users_sex)
+        self.out_dim = 1
+        self.sigmoid = nn.Sigmoid()
+        self.criterion = nn.BCELoss()
+
+        self.net = nn.Sequential(
+            nn.Linear(self.embed_dim, int(self.embed_dim * 4 ), bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Linear(int(self.embed_dim * 4), int(self.embed_dim*2),bias=True),
+            nn.LeakyReLU(0.2),
+            # # nn.Linear(int(self.embed_dim * 8), int(self.embed_dim*2),bias=True),
+            # # nn.LeakyReLU(0.2),
+            nn.Linear(int(self.embed_dim * 2), int(self.embed_dim),bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Linear(int(self.embed_dim), int(self.embed_dim/2), bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Linear(int(self.embed_dim / 2), self.out_dim,bias=True)
+            )
+
+    def forward(self, ents_emb, ents, return_loss=False):
+        scores = self.net(ents_emb)
+        output = self.sigmoid(scores)
+        A_labels = Variable(torch.FloatTensor(self.users_sensitive[ents])).cuda()
+        if return_loss:
+            loss = self.criterion(output.squeeze(), A_labels)
+            return loss
+        else:
+            return output.squeeze(),A_labels
+
+    def predict(self, ents_emb, ents, return_preds=False):
+        with torch.no_grad():
+            scores = self.net(ents_emb)
+            output = self.sigmoid(scores)
+            A_labels = Variable(torch.FloatTensor(self.users_sensitive[ents])).cuda()
+            preds = (output > torch.Tensor([0.5]).cuda()).float() * 1
+        if return_preds:
+            return output.squeeze(),A_labels,preds
+        else:
+            return output.squeeze(),A_labels
+
+    def save(self, fn):
+        torch.save(self.state_dict(), fn)
+
+    def load(self, fn):
+        self.load_state_dict(torch.load(fn))
+
+class AgeDiscriminator(nn.Module):
+    def __init__(self,use_1M,embed_dim,attribute_data,attribute,use_cross_entropy=True):
+        super(AgeDiscriminator, self).__init__()
+        self.embed_dim = int(embed_dim)
+        self.attribute_data = attribute_data
+        self.attribute = attribute
+        self.criterion = nn.NLLLoss()
+        if use_cross_entropy:
+            self.cross_entropy = True
+        else:
+            self.cross_entropy = False
+
+        users_age = attribute_data[0]['age'].values
+        users_age_list = sorted(set(users_age))
+        if not use_1M:
+            bins = np.linspace(5, 75, num=15, endpoint=True)
+            inds = np.digitize(users_age, bins) - 1
+            self.users_sensitive = np.ascontiguousarray(inds)
+            self.out_dim = len(bins)
+        else:
+            reindex = {1:0, 18:1, 25:2, 35:3, 45:4, 50:5, 56:6}
+            inds = [reindex.get(n, n) for n in users_age]
+            self.users_sensitive = np.ascontiguousarray(inds)
+            self.out_dim = 7
+
+        self.net = nn.Sequential(
+            nn.Linear(self.embed_dim, int(self.embed_dim * 4 ), bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Linear(int(self.embed_dim * 4), int(self.embed_dim*2),bias=True),
+            nn.LeakyReLU(0.2),
+            # # nn.Linear(int(self.embed_dim * 8), int(self.embed_dim*2),bias=True),
+            # # nn.LeakyReLU(0.2),
+            nn.Linear(int(self.embed_dim * 2), int(self.embed_dim),bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Linear(int(self.embed_dim), int(self.embed_dim/2), bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Linear(int(self.embed_dim / 2), self.out_dim,bias=True)
+            )
+
+    def forward(self, ents_emb, ents, return_loss=False):
+        scores = self.net(ents_emb)
+        output = F.log_softmax(scores, dim=1)
+        A_labels = Variable(torch.LongTensor(self.users_sensitive[ents])).cuda()
+        if return_loss:
+            loss = self.criterion(output.squeeze(), A_labels)
+            return loss
+        else:
+            return output.squeeze(),A_labels
+
+    def predict(self, ents_emb, ents, return_preds=False):
+        with torch.no_grad():
+            scores = self.net(ents_emb)
+            output = F.log_softmax(scores, dim=1)
+            A_labels = Variable(torch.LongTensor(self.users_sensitive[ents])).cuda()
+            preds = output.max(1, keepdim=True)[1] # get the index of the max
+        if return_preds:
+            return output.squeeze(),A_labels,preds
+        else:
+            return output.squeeze(),A_labels
+
+    def save(self, fn):
+        torch.save(self.state_dict(), fn)
+
+    def load(self, fn):
+        self.load_state_dict(torch.load(fn))
+
+class OccupationDiscriminator(nn.Module):
+    def __init__(self,use_1M,embed_dim,attribute_data,attribute,use_cross_entropy=True):
+        super(OccupationDiscriminator, self).__init__()
+        self.embed_dim = int(embed_dim)
+        self.attribute_data = attribute_data
+        self.attribute = attribute
+        self.criterion = nn.NLLLoss()
+        if use_cross_entropy:
+            self.cross_entropy = True
+        else:
+            self.cross_entropy = False
+
+        users_occupation = attribute_data[0]['occupation']
+        if use_1M:
+            self.users_sensitive = np.ascontiguousarray(users_occupation.values)
+            self.out_dim = 21
+        else:
+            users_occupation_list = sorted(set(users_occupation))
+            occ_to_idx = {}
+            for i, occ in enumerate(users_occupation_list):
+                occ_to_idx[occ] = i
+            users_occupation = [occ_to_idx[occ] for occ in users_occupation]
+            self.users_sensitive = np.ascontiguousarray(users_occupation)
+            self.out_dim = len(users_occupation_list)
+
+        self.net = nn.Sequential(
+            nn.Linear(self.embed_dim, int(self.embed_dim * 4 ), bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Linear(int(self.embed_dim * 4), int(self.embed_dim*2),bias=True),
+            nn.LeakyReLU(0.2),
+            # # nn.Linear(int(self.embed_dim * 8), int(self.embed_dim*2),bias=True),
+            # # nn.LeakyReLU(0.2),
+            nn.Linear(int(self.embed_dim * 2), int(self.embed_dim),bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Linear(int(self.embed_dim), int(self.embed_dim/2), bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Linear(int(self.embed_dim / 2), self.out_dim,bias=True)
+            )
+
+    def forward(self, ents_emb, ents, return_loss=False):
+        scores = self.net(ents_emb)
+        output = F.log_softmax(scores, dim=1)
+        A_labels = Variable(torch.LongTensor(self.users_sensitive[ents])).cuda()
+        if return_loss:
+            loss = self.criterion(output.squeeze(), A_labels)
+            return loss
+        else:
+            return output.squeeze(),A_labels
+
+    def predict(self, ents_emb, ents, return_preds=False):
+        with torch.no_grad():
+            scores = self.net(ents_emb)
+            output = F.log_softmax(scores, dim=1)
+            A_labels = Variable(torch.LongTensor(self.users_sensitive[ents])).cuda()
+            preds = output.max(1, keepdim=True)[1] # get the index of the max
+        if return_preds:
+            return output.squeeze(),A_labels,preds
+        else:
+            return output.squeeze(),A_labels
+
+    def save(self, fn):
+        torch.save(self.state_dict(), fn)
+
+    def load(self, fn):
+        self.load_state_dict(torch.load(fn))
+
+class DemParDisc2(nn.Module):
+    def __init__(self, use_1M,  embed_dim, attribute_data,attribute='gender',use_cross_entropy=True):
+        super(DemParDisc2, self).__init__()
+        self.embed_dim = int(embed_dim)
+        self.attribute_data = attribute_data
+        if use_cross_entropy:
+            self.cross_entropy = True
+        else:
+            self.cross_entropy = False
+        if attribute == 'gender':
+            users_sex = attribute_data[0]['sex']
+            users_sex = [0 if i == 'M' else 1 for i in users_sex]
+            self.users_sensitive = np.ascontiguousarray(users_sex)
+            self.out_dim = 2
+        elif attribute == 'occupation':
+            users_occupation = attribute_data[0]['occupation']
+            if use_1M:
+                self.users_sensitive = np.ascontiguousarray(users_occupation.values)
+                self.out_dim = 21
+            else:
+                users_occupation_list = sorted(set(users_occupation))
+                occ_to_idx = {}
+                for i, occ in enumerate(users_occupation_list):
+                    occ_to_idx[occ] = i
+                users_occupation = [occ_to_idx[occ] for occ in users_occupation]
+                self.users_sensitive = np.ascontiguousarray(users_occupation)
+                self.out_dim = len(users_occupation_list)
+        elif attribute == 'random':
+            users_random = attribute_data[0]['rand']
+            self.users_sensitive = np.ascontiguousarray(users_random)
+            self.out_dim = 2
+        else:
+            users_age = attribute_data[0]['age'].values
+            users_age_list = sorted(set(users_age))
+            if not use_1M:
+                bins = np.linspace(5, 75, num=15, endpoint=True)
+                inds = np.digitize(users_age, bins) - 1
+                self.users_sensitive = np.ascontiguousarray(inds)
+                self.out_dim = len(bins)
+            else:
+                reindex = {1:0, 18:1, 25:2, 35:3, 45:4, 50:5, 56:6}
+                inds = [reindex.get(n, n) for n in users_age]
+                self.users_sensitive = np.ascontiguousarray(inds)
+                self.out_dim = 7
+        self.net = nn.Sequential(
+            nn.Linear(self.embed_dim, int(self.embed_dim * 4), bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Linear(int(self.embed_dim * 4), int(self.embed_dim*2),bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Linear(int(self.embed_dim * 2), int(self.embed_dim),bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Linear(int(self.embed_dim), int(self.embed_dim/2), bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Linear(int(self.embed_dim / 2), self.out_dim,bias=True)
+            )
+        self.attribute = attribute
+
+    def forward(self, ents_emb, ents):
+        scores = self.net(ents_emb)
+        output = F.log_softmax(scores, dim=1)
+        A_labels = Variable(torch.LongTensor(self.users_sensitive[ents])).cuda()
+        loss = F.nll_loss(output, A_labels)
+        # if self.attribute == 'gender' or self.attribute == 'random':
+            # A_labels = Variable(torch.Tensor(self.users_sensitive[ents])).cuda()
+            # A_labels = A_labels.unsqueeze(1)
+            # loss = F.binary_cross_entropy_with_logits(scores,A_labels)
+        # else:
+            # output = F.log_softmax(scores, dim=1)
+            # A_labels = Variable(torch.LongTensor(self.users_sensitive[ents])).cuda()
+            # loss = F.nll_loss(output, A_labels)
+        return loss
+
+    def predict(self, ents_emb, ents, return_preds=False):
+        scores = self.net(ents_emb)
+        A_labels = Variable(torch.LongTensor(self.users_sensitive[ents])).cuda()
+        output = F.log_softmax(scores, dim=1)
+        probs = torch.exp(output)
+        preds = output.max(1, keepdim=True)[1] # get the index of the max
+        # if self.attribute == 'gender':
+            # A_labels = A_labels.unsqueeze(1)
+            # probs = F.sigmoid(scores)
+            # preds = (probs > torch.Tensor([0.5]).cuda()).float() * 1
+        # else:
+            # output = F.log_softmax(scores, dim=1)
+            # probs = torch.exp(output)
+            # preds = output.max(1, keepdim=True)[1] # get the index of the max
+        correct = preds.eq(A_labels.view_as(preds)).sum().item()
+        if return_preds:
+            return preds, A_labels, probs
+        else:
+            return correct
+
+    def save(self, fn):
+        torch.save(self.state_dict(), fn)
+
+    def load(self, fn):
+        self.loaded = True
         self.load_state_dict(torch.load(fn))
 
 class DemParDisc(nn.Module):

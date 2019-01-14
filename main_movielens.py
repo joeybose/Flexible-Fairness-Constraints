@@ -19,7 +19,7 @@ import sys, os
 import subprocess
 from tqdm import tqdm
 tqdm.monitor_interval = 0
-from utils import create_or_append, compute_rank
+from utils import *
 from preprocess_movie_lens import *
 from transD_movielens import *
 import joblib
@@ -29,61 +29,15 @@ sys.path.append('../')
 import gc
 from model import *
 
-ftensor = torch.FloatTensor
+# ftensor = torch.FloatTensor
 ltensor = torch.LongTensor
 
 v2np = lambda v: v.data.cpu().numpy()
 USE_SPARSE_EMB = True
 
-class KBDataset(Dataset):
-    def __init__(self,data_split,prefetch_to_gpu=False):
-        self.prefetch_to_gpu = prefetch_to_gpu
-        self.dataset = np.ascontiguousarray(data_split)
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        return self.dataset[idx]
-
-    def shuffle(self):
-        if self.dataset.is_cuda:
-            self.dataset = self.dataset.cpu()
-
-        data = self.dataset
-        np.random.shuffle(data)
-        data = np.ascontiguousarray(data)
-        self.dataset = ltensor(data)
-
-        if self.prefetch_to_gpu:
-            self.dataset = self.dataset.cuda().contiguous()
-
-class NodeClassification(Dataset):
-    def __init__(self,data_split,prefetch_to_gpu=False):
-        self.prefetch_to_gpu = prefetch_to_gpu
-        self.dataset = np.ascontiguousarray(data_split)
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        return self.dataset[idx]
-
-    def shuffle(self):
-        if self.dataset.is_cuda:
-            self.dataset = self.dataset.cpu()
-
-        data = self.dataset
-        np.random.shuffle(data)
-        data = np.ascontiguousarray(data)
-        self.dataset = ltensor(data)
-
-        if self.prefetch_to_gpu:
-            self.dataset = self.dataset.cuda().contiguous()
-
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--show_tqdm', type=int, default=0, help='')
+    parser.add_argument('--show_tqdm', type=bool, default=False, help='')
     parser.add_argument('--save_dir', type=str, default='./results/MovieLens/', help="output path")
     parser.add_argument('--model_save_dir', type=str, default='./results/', help="output path")
     parser.add_argument('--do_log', action='store_true', help="whether to log to csv")
@@ -98,11 +52,11 @@ def parse_args():
     parser.add_argument('--num_classifier_epochs', type=int, default=10, help='Number of training epochs (default: 500)')
     parser.add_argument('--batch_size', type=int, default=8192, help='Batch size (default: 512)')
     parser.add_argument('--gamma', type=int, default=1, help='Tradeoff for Adversarial Penalty')
-    parser.add_argument('--valid_freq', type=int, default=2, help='Validate frequency in epochs (default: 50)')
+    parser.add_argument('--valid_freq', type=int, default=99, help='Validate frequency in epochs (default: 50)')
     parser.add_argument('--print_freq', type=int, default=5, help='Print frequency in epochs (default: 5)')
     parser.add_argument('--embed_dim', type=int, default=50, help='Embedding dimension (default: 50)')
     parser.add_argument('--z_dim', type=int, default=100, help='noise Embedding dimension (default: 100)')
-    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate (default: 0.001)')
+    parser.add_argument('--lr', type=float, default=0.01, help='Learning rate (default: 0.001)')
     parser.add_argument('--margin', type=float, default=3, help='Loss margin (default: 1)')
     parser.add_argument('--p', type=int, default=1, help='P value for p-norm (default: 1)')
     parser.add_argument('--prefetch_to_gpu', type=int, default=0, help="")
@@ -110,6 +64,7 @@ def parse_args():
     parser.add_argument('--filter_false_negs', type=int, default=1, help="filter out sampled false negatives")
     parser.add_argument('--seed', type=int, default=0, help='random seed')
     parser.add_argument('--use_1M', type=bool, default=False, help='Use 1M dataset')
+    parser.add_argument('--report_bias', type=bool, default=True, help='Report dataset bias')
     parser.add_argument('--use_attr', type=bool, default=False, help='Initialize all Attribute')
     parser.add_argument('--use_occ_attr', type=bool, default=False, help='Use Only Occ Attribute')
     parser.add_argument('--use_gender_attr', type=bool, default=False, help='Use Only Gender Attribute')
@@ -152,6 +107,7 @@ def parse_args():
     else:
         cutoff_constant = 0.8
     train_cutoff_row = int(np.round(len(users)*cutoff_constant))
+    args.cutoff_row = train_cutoff_row
     args.users_train = users[:train_cutoff_row]
     args.users_test = users[train_cutoff_row:]
     if not os.path.exists(args.save_dir):
@@ -206,19 +162,20 @@ def main(args):
     if args.use_attr:
         attr_data = [args.users,args.movies]
         ''' Initialize Discriminators '''
-        fairD_gender = DemParDisc(args.use_1M,args.embed_dim,attr_data,use_cross_entropy=args.use_cross_entropy)
-        fairD_occupation = DemParDisc(args.use_1M,args.embed_dim,attr_data,\
+        fairD_gender = GenderDiscriminator(args.use_1M,args.embed_dim,attr_data,\
+                'gender',use_cross_entropy=args.use_cross_entropy).to(args.device)
+        fairD_occupation = OccupationDiscriminator(args.use_1M,args.embed_dim,attr_data,\
                 attribute='occupation',use_cross_entropy=args.use_cross_entropy)
-        fairD_age = DemParDisc(args.use_1M,args.embed_dim,attr_data,\
+        fairD_age = AgeDiscriminator(args.use_1M,args.embed_dim,attr_data,\
                 attribute='age',use_cross_entropy=args.use_cross_entropy)
-        fairD_random = DemParDisc(args.use_1M,args.embed_dim,attr_data,\
-                attribute='random',use_cross_entropy=args.use_cross_entropy)
+        # fairD_random = DemParDisc2(args.use_1M,args.embed_dim,attr_data,\
+                # attribute='random',use_cross_entropy=args.use_cross_entropy)
 
         ''' Initialize Optimizers '''
         if args.sample_mask:
-            gender_filter = AttributeFilter(args.embed_dim,attribute='gender')
-            occupation_filter = AttributeFilter(args.embed_dim,attribute='occupation')
-            age_filter = AttributeFilter(args.embed_dim,attribute='age')
+            gender_filter = AttributeFilter(args.embed_dim,attribute='gender').to(args.device)
+            occupation_filter = AttributeFilter(args.embed_dim,attribute='occupation').to(args.device)
+            age_filter = AttributeFilter(args.embed_dim,attribute='age').to(args.device)
             if not args.use_trained_filters:
                 ''' Optimize the Filters oth. it's Pretrained '''
                 optimizer_fairD_gender = optimizer(list(fairD_gender.parameters()) + \
@@ -234,16 +191,17 @@ def main(args):
 
     elif args.use_occ_attr:
         attr_data = [args.users,args.movies]
-        fairD_occupation = DemParDisc(args.use_1M,args.embed_dim,attr_data,\
+        fairD_occupation = OccupationDiscriminator(args.use_1M,args.embed_dim,attr_data,\
                 attribute='occupation',use_cross_entropy=args.use_cross_entropy)
         optimizer_fairD_occupation = optimizer(fairD_occupation.parameters(),'adam',args.lr)
     elif args.use_gender_attr:
         attr_data = [args.users,args.movies]
-        fairD_gender = DemParDisc(args.use_1M,args.embed_dim,attr_data,use_cross_entropy=args.use_cross_entropy)
+        fairD_gender = GenderDiscriminator(args.use_1M,args.embed_dim,attr_data,\
+                'gender',use_cross_entropy=args.use_cross_entropy)
         optimizer_fairD_gender = optimizer(fairD_gender.parameters(),'adam', args.lr)
     elif args.use_age_attr:
         attr_data = [args.users,args.movies]
-        fairD_age = DemParDisc(args.use_1M,args.embed_dim,attr_data,\
+        fairD_age = AgeDiscriminator(args.use_1M,args.embed_dim,attr_data,\
                 attribute='age',use_cross_entropy=args.use_cross_entropy)
         optimizer_fairD_age = optimizer(fairD_age.parameters(),'adam', args.lr)
     elif args.use_random_attr:
@@ -296,6 +254,7 @@ def main(args):
         freeze_model(modelD)
 
     if args.debug:
+        attr_data = [args.users,args.movies]
         ipdb.set_trace()
 
     ''' Joint Training '''
@@ -312,24 +271,18 @@ def main(args):
                             rmse,test_loss = test_gcmc(test_set, args, modelD)
                         else:
                             l_ranks,r_ranks,avg_mr,avg_mrr,avg_h10,avg_h5 = test(test_set, args, all_hash,\
-                                    modelD,subsample=10)
+                                    modelD,subsample=20)
 
                     if args.use_attr:
-                        test_fairness(test_fairness_set,args,modelD,experiment,\
-                                fairD_gender, attribute='gender',epoch=epoch)
-                        test_fairness(test_fairness_set,args,modelD,experiment,\
-                                fairD_occupation,attribute='occupation', epoch=epoch)
-                        test_fairness(test_fairness_set,args,modelD,experiment,\
-                                fairD_age,attribute='age', epoch=epoch)
+                        test_gender(args,test_fairness_set,modelD,fairD_gender,experiment,epoch)
+                        test_occupation(args,test_fairness_set,modelD,fairD_occupation,experiment,epoch)
+                        test_age(args,test_fairness_set,modelD,fairD_age,experiment,epoch)
                     elif args.use_gender_attr:
-                        test_fairness(test_fairness_set,args,modelD,experiment,\
-                                fairD_gender, attribute='gender',epoch=epoch)
+                        test_gender(args,test_fairness_set,modelD,fairD_gender,experiment,epoch)
                     elif args.use_occ_attr:
-                        test_fairness(test_fairness_set,args,modelD,experiment,\
-                                fairD_occupation,attribute='occupation', epoch=epoch)
+                        test_occupation(args,test_fairness_set,modelD,fairD_occupation,experiment,epoch)
                     elif args.use_age_attr:
-                        test_fairness(test_fairness_set,args,modelD,experiment,\
-                                fairD_age,attribute='age', epoch=epoch)
+                        test_age(args,test_fairness_set,modelD,fairD_age,experiment,epoch)
                     elif args.use_random_attr:
                         test_fairness(test_fairness_set,args,modelD,experiment,\
                                 fairD_random,attribute='random', epoch=epoch)
@@ -350,10 +303,10 @@ def main(args):
                         rmse = test_gcmc(test_set, args, modelD)
                     else:
                         l_ranks,r_ranks,avg_mr,avg_mrr,avg_h10,avg_h5 = test(test_set,args, all_hash,\
-                                modelD)
-        if not args.use_gcmc:
-            l_ranks,r_ranks,avg_mr,avg_mrr,avg_h10,avg_h5 = test(test_set,args, all_hash, modelD)
-            joblib.dump({'l_ranks':l_ranks, 'r_ranks':r_ranks}, args.outname_base+'test_ranks.pkl', compress=9)
+                                modelD,subsample=20)
+        # if not args.use_gcmc:
+            # l_ranks,r_ranks,avg_mr,avg_mrr,avg_h10,avg_h5 = test(test_set,args, all_hash, modelD)
+            # joblib.dump({'l_ranks':l_ranks, 'r_ranks':r_ranks}, args.outname_base+'test_ranks.pkl', compress=9)
 
         modelD.save(args.outname_base+'D_final.pts')
         if args.use_attr or args.use_gender_attr:
@@ -362,7 +315,7 @@ def main(args):
             fairD_occupation.save(args.outname_base+'OccupationFairD_final.pts')
         if args.use_attr or args.use_age_attr:
             fairD_age.save(args.outname_base+'AgeFairD_final.pts')
-        if args.use_attr or args.use_random_attr:
+        if args.use_random_attr:
             fairD_random.save(args.outname_base+'RandomFairD_final.pts')
 
         if args.sample_mask:
@@ -371,119 +324,45 @@ def main(args):
             age_filter.save(args.outname_base+'AgeFilter.pts')
 
     constant = len(fairD_set) - fairD_set.count(None)
-    if constant != 0:
-        new_fairD_gender,new_fairD_occupation,new_fairD_age,new_fairD_random = None,None,None,None
-        new_optimizer_fairD_gender,new_optimizer_fairD_occupation,\
-                new_optimizer_fairD_age,new_optimizer_fairD_random = None,None,None,None
+    if constant != 0 or args.test_new_disc:
+        if args.test_new_disc:
+            args.use_attr = True
         ''' Training Fresh Discriminators'''
         args.freeze_transD = True
         attr_data = [args.users,args.movies]
-        if args.use_attr or args.use_gender_attr:
-            new_fairD_gender = DemParDisc(args.use_1M,args.embed_dim,attr_data,\
-                    use_cross_entropy=args.use_cross_entropy).to(args.device)
-            new_optimizer_fairD_gender = optimizer(new_fairD_gender.parameters(),'adam', args.lr)
-        if args.use_attr or args.use_occ_attr:
-            new_fairD_occupation = DemParDisc(args.use_1M,args.embed_dim,attr_data,\
-                    attribute='occupation',use_cross_entropy=args.use_cross_entropy).to(args.device)
-            new_optimizer_fairD_occ = optimizer(new_fairD_occupation.parameters(),'adam', args.lr)
-        if args.use_attr or args.use_age_attr:
-            new_fairD_age = DemParDisc(args.use_1M,args.embed_dim,attr_data,\
-                    attribute='age',use_cross_entropy=args.use_cross_entropy).to(args.device)
-            new_optimizer_fairD_age = optimizer(new_fairD_age.parameters(),'adam', args.lr)
-        if args.use_attr or args.use_random_attr:
+        if args.use_random_attr:
             new_fairD_random = DemParDisc(args.use_1M,args.embed_dim,attr_data,\
                     attribute='random',use_cross_entropy=args.use_cross_entropy).to(args.device)
             new_optimizer_fairD_random = optimizer(new_fairD_random.parameters(),'adam', args.lr)
-        new_fairD_set = [new_fairD_gender,new_fairD_occupation,new_fairD_age,new_fairD_random]
-        new_optimizer_fairD_set = [new_optimizer_fairD_gender,new_optimizer_fairD_occupation,\
-                new_optimizer_fairD_age,new_optimizer_fairD_random]
+
         freeze_model(modelD)
         with experiment.test():
-            for epoch in tqdm(range(1, args.num_classifier_epochs + 1)):
-                ''' Train Classifier '''
-                if args.use_gender_attr:
-                    train_fairness_classifier(train_fairness_set,args,modelD,experiment,new_fairD_gender,\
-                            new_optimizer_fairD_gender,epoch,filter_=None,retrain=False)
-                if args.use_occ_attr:
-                    train_fairness_classifier(train_fairness_set,args,modelD,experiment,new_fairD_occupation,\
-                            new_optimizer_fairD_occ,epoch,filter_=None,retrain=False)
-                if args.use_age_attr:
-                    train_fairness_classifier(train_fairness_set,args,modelD,experiment,new_fairD_age,\
-                            new_optimizer_fairD_age,epoch,filter_=None,retrain=False)
-                if args.use_random_attr:
-                    train_fairness_classifier(train_fairness_set,args,modelD,experiment,new_fairD_random,\
-                            new_optimizer_fairD_random,epoch,filter_=None,retrain=False)
-                gc.collect()
+            ''' Train Classifier '''
+            if args.use_gender_attr or args.use_attr:
+                train_gender(args,modelD,train_fairness_set,test_fairness_set,\
+                        attr_data,experiment)
+            if args.use_occ_attr or args.use_attr:
+                train_occupation(args,modelD,train_fairness_set,test_fairness_set,\
+                        attr_data,experiment)
+            if args.use_age_attr or args.use_attr:
+                train_age(args,modelD,train_fairness_set,test_fairness_set,attr_data,experiment)
+            if args.use_random_attr:
+                train_fairness_classifier(train_fairness_set,args,modelD,experiment,new_fairD_random,\
+                        new_optimizer_fairD_random,epoch,filter_=None,retrain=False)
 
-                if not args.use_gcmc:
-                    with torch.no_grad():
-                        l_ranks,r_ranks,avg_mr,avg_mrr,avg_h10,avg_h5 = test(test_set, args, all_hash,\
-                                modelD,subsample=10)
-
-                if args.use_attr:
-                    test_fairness(test_fairness_set,args,modelD,experiment,\
-                            new_fairD_gender, attribute='gender',epoch=epoch)
-                    test_fairness(test_fairness_set,args,modelD,experiment,\
-                            fairD_occupation,attribute='occupation', epoch=epoch)
-                    test_fairness(test_fairness_set,args,modelD,experiment,\
-                            fairD_age,attribute='age', epoch=epoch)
-                elif args.use_gender_attr:
-                    test_fairness(test_fairness_set,args,modelD,experiment,\
-                            new_fairD_gender, attribute='gender',epoch=epoch)
-                elif args.use_occ_attr:
-                    test_fairness(test_fairness_set,args,modelD,experiment,\
-                            fairD_occupation,attribute='occupation', epoch=epoch)
-                elif args.use_age_attr:
-                    test_fairness(test_fairness_set,args,modelD,experiment,\
-                            fairD_age,attribute='age', epoch=epoch)
-                elif args.use_random_attr:
-                    test_fairness(test_fairness_set,args,modelD,experiment,\
-                            fairD_random,attribute='random', epoch=epoch)
-
-                if args.do_log and not args.use_gcmc: # Tensorboard logging
-                    experiment.log_metric("Mean Rank",float(avg_mr),step=epoch)
-                    experiment.log_metric("Mean Reciprocal Rank",\
-                            float(avg_mrr),step=epoch)
-                    experiment.log_metric("Hit @10",float(avg_h10),step=epoch)
-                    experiment.log_metric("Hit @5",float(avg_h5),step=epoch)
-
-                if epoch % (args.valid_freq * 5) == 0 and not args.use_gcmc:
-                    l_ranks,r_ranks,avg_mr,avg_mrr,avg_h10,avg_h5 = test(test_set,args, all_hash,\
-                            modelD)
-
-    # if args.test_new_disc:
-        # if args.sample_mask:
-            # args.use_trained_filters = True
-            # ''' Test With Filters '''
-            # retrain_disc(args,train_loader,train_hash,test_set,modelD,\
-                    # optimizerD,experiment,gender_filter,occupation_filter=None,\
-                    # age_filter=None,attribute='gender')
-            # retrain_disc(args,train_loader,train_hash,test_set,modelD,\
-                    # optimizerD,experiment,occupation_filter=occupation_filter,\
-                    # gender_filter=None,age_filter=None,attribute='occupation')
-            # retrain_disc(args,train_loader,train_hash,test_set,modelD,\
-                    # optimizerD,experiment,age_filter=age_filter,gender_filter=None,\
-                    # occupation_filter=None,attribute='age')
-
-        # args.use_trained_filters = False
-
-        # '''Test Without Filters '''
-        # if args.use_attr or args.use_gender_attr:
-            # retrain_disc(args,train_loader,train_hash,test_set,modelD,\
-                    # optimizerD,experiment,gender_filter=None,\
-                    # occupation_filter=None,age_filter=None,attribute='gender')
-        # if args.use_attr or args.use_occ_attr:
-            # retrain_disc(args,train_loader,train_hash,test_set,modelD,\
-                    # optimizerD,experiment,gender_filter=None,\
-                    # occupation_filter=None,age_filter=None,attribute='occupation')
-        # if args.use_attr or args.use_age_attr:
-            # retrain_disc(args,train_loader,train_hash,test_set,modelD,\
-                    # optimizerD,experiment,gender_filter=None,\
-                    # occupation_filter=None,age_filter=None,attribute='age')
-        # if args.use_attr or args.use_random_attr:
-            # retrain_disc(args,train_loader,train_hash,test_set,modelD,\
-                    # optimizerD,experiment,gender_filter=None,\
-                    # occupation_filter=None,age_filter=None,attribute='random')
+        if args.report_bias:
+            gender_bias = calc_attribute_bias('Train',args,modelD,experiment,\
+                    'gender',epoch,gender_filter)
+            occ_bias = calc_attribute_bias('Train',args,modelD,experiment,\
+                    'occupation',epoch,gender_filter)
+            age_bias = calc_attribute_bias('Train',args,modelD,experiment,\
+                    'age',epoch,gender_filter)
+            gender_bias = calc_attribute_bias('Test',args,modelD,experiment,\
+                    'gender',epoch,gender_filter)
+            occ_bias = calc_attribute_bias('Test',args,modelD,experiment,\
+                    'occupation',epoch,gender_filter)
+            age_bias = calc_attribute_bias('Test',args,modelD,experiment,\
+                    'age',epoch,gender_filter)
         experiment.end()
 
 if __name__ == '__main__':
