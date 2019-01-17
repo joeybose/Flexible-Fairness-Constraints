@@ -44,7 +44,8 @@ def optimizer(params, mode, *args, **kwargs):
         opt = optim.SGD(params, *args, momentum=momentum, nesterov=True, **kwargs)
     elif mode.lower() == 'adam':
         betas = kwargs.pop('betas', (.9, .999))
-        opt = optim.Adam(params, *args, betas=betas, amsgrad=True, **kwargs)
+        opt = optim.Adam(params, *args, betas=betas, amsgrad=True,
+                weight_decay=1e-4, **kwargs)
     elif mode.lower() == 'adam_hyp2':
         betas = kwargs.pop('betas', (.5, .99))
         opt = optim.Adam(params, *args, betas=betas, amsgrad=True, **kwargs)
@@ -53,7 +54,7 @@ def optimizer(params, mode, *args, **kwargs):
         opt = optim.Adam(params, *args, betas=betas, amsgrad=True, **kwargs)
     elif mode.lower() == 'adam_sparse':
         betas = kwargs.pop('betas', (.9, .999))
-        opt = optim.SparseAdam(params, *args, betas=betas)
+        opt = optim.SparseAdam(params, *args, weight_decay=1e-4, betas=betas)
     elif mode.lower() == 'adam_sparse_hyp2':
         betas = kwargs.pop('betas', (.5, .99))
         opt = optim.SparseAdam(params, *args, betas=betas)
@@ -331,17 +332,17 @@ def train_nce(data_loader,counter,args,train_hash,modelD,optimizerD,\
                     fair_optim.zero_grad()
                     ''' No Gradients Past Here '''
                     with torch.no_grad():
-                        d_outs,lhs_emb,rhs_emb,rel_emb = modelD(d_ins,True)
+                        d_outs,lhs_emb,rhs_emb,rel_emb = modelD(d_ins,True,filters=masked_filter_set)
                         p_lhs_emb = lhs_emb[:len(p_batch)]
 
-                        ''' Apply Filter or Not to Embeddings '''
-                        if args.sample_mask or args.use_trained_filters:
-                            filter_emb = 0
-                            for filter_ in masked_filter_set:
-                                if filter_ is not None:
-                                    filter_emb += filter_(p_lhs_emb)
-                        else:
-                            filter_emb = p_lhs_emb
+                        # ''' Apply Filter or Not to Embeddings '''
+                        # if args.sample_mask or args.use_trained_filters:
+                            # filter_emb = 0
+                            # for filter_ in masked_filter_set:
+                                # if filter_ is not None:
+                                    # filter_emb += filter_(p_lhs_emb)
+                        # else:
+                        filter_emb = p_lhs_emb
                         probs, l_A_labels, l_preds = fairD_disc.predict(filter_emb,p_batch[:,0],True)
                         l_correct = l_preds.eq(l_A_labels.view_as(l_preds)).sum().item()
                         if fairD_disc.attribute == 'gender':
@@ -413,14 +414,13 @@ def train_gcmc(data_loader,counter,args,train_hash,modelD,optimizerD,\
 
         ''' Update GCMC Model '''
         if constant != 0:
-            task_loss,preds,lhs_emb,rhs_emb = modelD(p_batch_var,return_embeds=True)
-            p_lhs_emb = lhs_emb[:len(p_batch_var)]
-            # p_rhs_emb = rhs_emb[:len(p_batch_var)]
+            task_loss,preds,lhs_emb,rhs_emb = modelD(p_batch_var,\
+                    return_embeds=True,filters=masked_filter_set)
+            filter_l_emb = lhs_emb[:len(p_batch_var)]
             l_penalty = 0
 
-            ''' Apply Filter or Not to Embeddings '''
-            filter_l_emb = apply_filters_gcmc(args,p_lhs_emb,masked_filter_set)
-            # filter_l_emb = p_lhs_emb
+            # ''' Apply Filter or Not to Embeddings '''
+            # filter_l_emb = apply_filters_gcmc(args,p_lhs_emb,masked_filter_set)
 
             ''' Apply Discriminators '''
             for fairD_disc, fair_optim in zip(masked_fairD_set,masked_optimizer_fairD_set):
@@ -435,23 +435,23 @@ def train_gcmc(data_loader,counter,args,train_hash,modelD,optimizerD,\
             if not args.freeze_transD:
                 optimizerD.zero_grad()
                 full_loss = task_loss + args.gamma*fair_penalty
-                full_loss.backward(retain_graph=True)
+                full_loss.backward(retain_graph=False)
                 optimizerD.step()
 
-            l_penalty_2 = 0
-            for fairD_disc, fair_optim in zip(masked_fairD_set,\
-                    masked_optimizer_fairD_set):
-                if fairD_disc is not None and fair_optim is not None:
-                    fair_optim.zero_grad()
-                    l_penalty_2 += fairD_disc(filter_l_emb.detach(),\
-                            p_batch[:,0],True)
-                    if not args.use_cross_entropy:
-                        fairD_loss = -1*(1 - l_penalty_2)
-                    else:
-                        fairD_loss = l_penalty_2
-                    fairD_loss.backward(retain_graph=True)
-                    fair_optim.step()
-
+            for k in range(0,args.D_steps):
+                l_penalty_2 = 0
+                for fairD_disc, fair_optim in zip(masked_fairD_set,\
+                        masked_optimizer_fairD_set):
+                    if fairD_disc is not None and fair_optim is not None:
+                        fair_optim.zero_grad()
+                        l_penalty_2 += fairD_disc(filter_l_emb.detach(),\
+                                p_batch[:,0],True)
+                        if not args.use_cross_entropy:
+                            fairD_loss = -1*(1 - l_penalty_2)
+                        else:
+                            fairD_loss = l_penalty_2
+                        fairD_loss.backward(retain_graph=True)
+                        fair_optim.step()
         else:
             task_loss,preds = modelD(p_batch_var)
             fair_penalty = Variable(torch.zeros(1)).cuda()
@@ -467,9 +467,8 @@ def train_gcmc(data_loader,counter,args,train_hash,modelD,optimizerD,\
             recall_list = []
             fscore_list = []
             correct = 0
-            for fairD_disc, fair_optim in zip(masked_fairD_set,masked_optimizer_fairD_set):
-                if fairD_disc is not None and fair_optim is not None:
-                    fair_optim.zero_grad()
+            for fairD_disc in masked_fairD_set:
+                if fairD_disc is not None:
                     ''' No Gradients Past Here '''
                     with torch.no_grad():
                         task_loss,preds,lhs_emb,rhs_emb = modelD(p_batch_var,return_embeds=True)
@@ -487,23 +486,23 @@ def train_gcmc(data_loader,counter,args,train_hash,modelD,optimizerD,\
                         l_correct = l_preds.eq(l_A_labels.view_as(l_preds)).sum().item()
                         if fairD_disc.attribute == 'gender':
                             fairD_gender_loss = fairD_loss.detach().cpu().numpy()
-                            l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
-                                    average='binary')
+                            # l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
+                                    # average='binary')
                             gender_correct += l_correct #
                         elif fairD_disc.attribute == 'occupation':
                             fairD_occupation_loss = fairD_loss.detach().cpu().numpy()
-                            l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
-                                    average='micro')
+                            # l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
+                                    # average='micro')
                             occupation_correct += l_correct
                         elif fairD_disc.attribute == 'age':
                             fairD_age_loss = fairD_loss.detach().cpu().numpy()
-                            l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
-                                    average='micro')
+                            # l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
+                                    # average='micro')
                             age_correct += l_correct
                         else:
                             fairD_random_loss = fairD_loss.detach().cpu().numpy()
-                            l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
-                                    average='micro')
+                            # l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
+                                    # average='micro')
                             random_correct += l_correct
 
     ''' Logging for end of epoch '''

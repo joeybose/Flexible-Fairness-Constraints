@@ -34,7 +34,36 @@ import gc
 from collections import OrderedDict
 from model import *
 
-def multiclass_roc_auc_score(y_test, y_pred, average="macro"):
+def optimizer(params, mode, *args, **kwargs):
+    if mode == 'SGD':
+        opt = optim.SGD(params, *args, momentum=0., **kwargs)
+    elif mode.startswith('nesterov'):
+        momentum = float(mode[len('nesterov'):])
+        opt = optim.SGD(params, *args, momentum=momentum, nesterov=True, **kwargs)
+    elif mode.lower() == 'adam':
+        betas = kwargs.pop('betas', (.9, .999))
+        opt = optim.Adam(params, *args, betas=betas, amsgrad=True,
+                weight_decay=1e-4, **kwargs)
+    elif mode.lower() == 'adam_hyp2':
+        betas = kwargs.pop('betas', (.5, .99))
+        opt = optim.Adam(params, *args, betas=betas, amsgrad=True, **kwargs)
+    elif mode.lower() == 'adam_hyp3':
+        betas = kwargs.pop('betas', (0., .99))
+        opt = optim.Adam(params, *args, betas=betas, amsgrad=True, **kwargs)
+    elif mode.lower() == 'adam_sparse':
+        betas = kwargs.pop('betas', (.9, .999))
+        opt = optim.SparseAdam(params, *args, weight_decay=1e-4, betas=betas)
+    elif mode.lower() == 'adam_sparse_hyp2':
+        betas = kwargs.pop('betas', (.5, .99))
+        opt = optim.SparseAdam(params, *args, betas=betas)
+    elif mode.lower() == 'adam_sparse_hyp3':
+        betas = kwargs.pop('betas', (.0, .99))
+        opt = optim.SparseAdam(params, *args, betas=betas)
+    else:
+        raise NotImplementedError()
+    return opt
+
+def multiclass_roc_auc_score(y_test, y_pred, average="micro"):
     y_test = np.asarray(y_test).squeeze()
     y_pred = np.asarray(y_pred).squeeze()
     lb = preprocessing.LabelBinarizer()
@@ -42,13 +71,14 @@ def multiclass_roc_auc_score(y_test, y_pred, average="macro"):
     y_test = lb.transform(y_test)
     return roc_auc_score(y_test, y_pred, average=average)
 
-def test_gender(args,test_dataset,modelD,net,experiment,epoch):
+def test_gender(args,test_dataset,modelD,net,experiment,\
+        epoch,filter_set=None):
     test_loader = DataLoader(test_dataset, num_workers=1, batch_size=512)
     correct = 0
     preds_list, labels_list = [],[]
     for p_batch in test_loader:
         p_batch_var = Variable(p_batch).cuda()
-        p_batch_emb = modelD.encode(p_batch_var.detach())
+        p_batch_emb = modelD.encode(p_batch_var.detach(),filter_set)
         y_hat, y = net.predict(p_batch_emb,p_batch_var)
         preds = (y_hat > torch.Tensor([0.5]).cuda()).float() * 1
         correct += preds.eq(y.view_as(preds)).sum().item()
@@ -56,28 +86,31 @@ def test_gender(args,test_dataset,modelD,net,experiment,epoch):
         labels_list.append(y)
     cat_preds_list = torch.cat(preds_list,0).data.cpu().numpy()
     cat_labels_list = torch.cat(labels_list,0).data.cpu().numpy()
-    AUC = roc_auc_score(cat_labels_list,cat_preds_list)
+    AUC = roc_auc_score(cat_labels_list,cat_preds_list,average="micro")
     acc = 100. * correct / len(test_dataset)
     print("Test Gender Accuracy is: %f AUC: %f" %(acc,AUC))
     if args.do_log:
         experiment.log_metric("Test"+net.attribute+" AUC",float(AUC),step=epoch)
+        experiment.log_metric("Test "+net.attribute+" Accuracy",float(acc),step=epoch)
 
-def train_gender(args,modelD,train_dataset,test_dataset,attr_data,experiment):
+def train_gender(args,modelD,train_dataset,test_dataset,\
+        attr_data,experiment,filter_set=None):
+    modelD.eval()
     net = GenderDiscriminator(args.use_1M,args.embed_dim,attr_data,\
             'gender',use_cross_entropy=args.use_cross_entropy).to(args.device)
-    opt = optim.Adam(net.parameters(), betas=(0.9, 0.999))
+    opt = optimizer(net.parameters(),'adam', args.lr)
     train_loader = DataLoader(train_dataset, num_workers=1, batch_size=3000)
     train_data_itr = enumerate(train_loader)
     criterion = nn.BCELoss()
 
-    for epoch in range(1,100):
+    for epoch in range(1,args.num_classifier_epochs):
         correct = 0
         if epoch % 10 == 0:
-            test_gender(args,test_dataset,modelD,net,experiment,epoch)
+            test_gender(args,test_dataset,modelD,net,experiment,epoch,filter_set)
 
         for p_batch in train_loader:
             p_batch_var = Variable(p_batch).cuda()
-            p_batch_emb = modelD.encode(p_batch_var.detach())
+            p_batch_emb = modelD.encode(p_batch_var.detach(),filter_set)
             opt.zero_grad()
             y_hat, y = net(p_batch_emb,p_batch_var)
             loss = criterion(y_hat, y)
@@ -86,19 +119,21 @@ def train_gender(args,modelD,train_dataset,test_dataset,attr_data,experiment):
             preds = (y_hat > torch.Tensor([0.5]).cuda()).float() * 1
             correct = preds.eq(y.view_as(preds)).sum().item()
             acc = 100. * correct / len(p_batch)
-            AUC = roc_auc_score(y.data.cpu().numpy(),preds.data.cpu().numpy())
+            AUC = roc_auc_score(y.data.cpu().numpy(),\
+                    preds.data.cpu().numpy(),average="micro")
             print("Train Gender Loss is %f Accuracy is: %f AUC: %f" %(loss,acc,AUC))
             if args.do_log:
-                experiment.log_metric("Train"+ net.attribute+"\
-                        AUC",float(AUC),step=epoch)
+                experiment.log_metric("Train "+ net.attribute+"\
+                         AUC",float(AUC),step=epoch)
 
-def test_age(args,test_dataset,modelD,net,experiment,epoch):
+def test_age(args,test_dataset,modelD,net,experiment,\
+        epoch,filter_set=None):
     test_loader = DataLoader(test_dataset, num_workers=1, batch_size=512)
     correct = 0
     preds_list, labels_list = [],[]
     for p_batch in test_loader:
         p_batch_var = Variable(p_batch).cuda()
-        p_batch_emb = modelD.encode(p_batch_var.detach())
+        p_batch_emb = modelD.encode(p_batch_var.detach(),filter_set)
         y_hat, y = net.predict(p_batch_emb,p_batch_var)
         preds = y_hat.max(1, keepdim=True)[1] # get the index of the max
         correct += preds.eq(y.view_as(preds)).sum().item()
@@ -111,23 +146,26 @@ def test_age(args,test_dataset,modelD,net,experiment,epoch):
     print("Test Age Accuracy is: %f AUC: %f" %(acc,AUC))
     if args.do_log:
         experiment.log_metric("Test"+net.attribute+"AUC",float(AUC),step=epoch)
+        experiment.log_metric("Test "+net.attribute+" Accuracy",float(acc),step=epoch)
 
-def train_age(args,modelD,train_dataset,test_dataset,attr_data,experiment):
+def train_age(args,modelD,train_dataset,test_dataset,attr_data,\
+        experiment,filter_set=None):
+    modelD.eval()
     net = AgeDiscriminator(args.use_1M,args.embed_dim,attr_data,\
             'age',use_cross_entropy=args.use_cross_entropy).to(args.device)
-    opt = optim.Adam(net.parameters(), betas=(0.9, 0.999))
+    opt = optimizer(net.parameters(),'adam', args.lr)
     train_loader = DataLoader(train_dataset, num_workers=1, batch_size=3000)
     train_data_itr = enumerate(train_loader)
     criterion = nn.NLLLoss()
 
-    for epoch in range(1,100):
+    for epoch in range(1,args.num_classifier_epochs):
         correct = 0
         if epoch % 10 == 0:
-            test_age(args,test_dataset,modelD,net,experiment,epoch)
+            test_age(args,test_dataset,modelD,net,experiment,epoch,filter_set)
 
         for p_batch in train_loader:
             p_batch_var = Variable(p_batch).cuda()
-            p_batch_emb = modelD.encode(p_batch_var.detach())
+            p_batch_emb = modelD.encode(p_batch_var.detach(),filter_set)
             opt.zero_grad()
             y_hat, y = net(p_batch_emb,p_batch_var)
             loss = criterion(y_hat, y)
@@ -141,13 +179,13 @@ def train_age(args,modelD,train_dataset,test_dataset,attr_data,experiment):
             if args.do_log:
                 experiment.log_metric("Train"+net.attribute+"AUC",float(AUC),step=epoch)
 
-def test_occupation(args,test_dataset,modelD,net,experiment,epoch):
+def test_occupation(args,test_dataset,modelD,net,experiment,epoch,filter_set=None):
     test_loader = DataLoader(test_dataset, num_workers=1, batch_size=8000)
     correct = 0
     preds_list, labels_list = [],[]
     for p_batch in test_loader:
         p_batch_var = Variable(p_batch).cuda()
-        p_batch_emb = modelD.encode(p_batch_var.detach())
+        p_batch_emb = modelD.encode(p_batch_var.detach(),filter_set)
         y_hat, y = net.predict(p_batch_emb,p_batch_var)
         preds = y_hat.max(1, keepdim=True)[1] # get the index of the max
         correct += preds.eq(y.view_as(preds)).sum().item()
@@ -166,24 +204,26 @@ def test_occupation(args,test_dataset,modelD,net,experiment,epoch):
         print("Test Occupation Accuracy is: %f" %(acc))
         if args.do_log:
             experiment.log_metric("Test"+net.attribute+" Accuracy",float(acc),step=epoch)
+            experiment.log_metric("Test "+net.attribute+" Accuracy",float(acc),step=epoch)
 
-
-def train_occupation(args,modelD,train_dataset,test_dataset,attr_data,experiment):
+def train_occupation(args,modelD,train_dataset,test_dataset,\
+        attr_data,experiment,filter_set=None):
+    modelD.eval()
     net = OccupationDiscriminator(args.use_1M,args.embed_dim,attr_data,\
             'occupation',use_cross_entropy=args.use_cross_entropy).to(args.device)
-    opt = optim.Adam(net.parameters(), betas=(0.9, 0.999))
+    opt = optimizer(net.parameters(),'adam', args.lr)
     train_loader = DataLoader(train_dataset, num_workers=1, batch_size=8000)
     train_data_itr = enumerate(train_loader)
     criterion = nn.NLLLoss()
 
-    for epoch in range(1,100):
+    for epoch in range(1,args.num_classifier_epochs):
         correct = 0
         if epoch % 10 == 0:
-            test_occupation(args,test_dataset,modelD,net,experiment,epoch)
+            test_occupation(args,test_dataset,modelD,net,experiment,epoch,filter_set)
 
         for p_batch in train_loader:
             p_batch_var = Variable(p_batch).cuda()
-            p_batch_emb = modelD.encode(p_batch_var.detach())
+            p_batch_emb = modelD.encode(p_batch_var.detach(),filter_set)
             opt.zero_grad()
             y_hat, y = net(p_batch_emb,p_batch_var)
             loss = criterion(y_hat, y)
@@ -209,6 +249,14 @@ def onevsall_bias(vals,pos_index):
         bias = torch.abs(vals[pos_index] - vals[i])
     weighted_avg_bias = bias / len(vals)
     return weighted_avg_bias
+def calc_majority_class(groups,attribute):
+    counts = []
+    for k in groups.keys():
+        counts.append(len(groups[k]))
+    counts = np.asarray(counts)
+    index = np.argmax(counts)
+    prob = 100. * np.max(counts) / counts.sum()
+    print("%s Majority Class %s has prob %f" %(attribute,index,prob))
 
 def calc_attribute_bias(mode,args,modelD,experiment,\
         attribute,epoch,filter_=None):
@@ -229,15 +277,14 @@ def calc_attribute_bias(mode,args,modelD,experiment,\
     groups = dataset.groups
     group_preds = defaultdict(list)
     group_embeds_list = []
+    calc_majority_class(groups,attribute)
     for idx, movies in test_data_itr:
         movies_var = Variable(movies).cuda()
         with torch.no_grad():
             movies_embed = modelD.encode(movies_var)
             for group, vals in groups.items():
                 users_var = Variable(torch.LongTensor(vals)).cuda()
-                users_embed = modelD.encode(users_var)
-                if filter_ is not None:
-                    users_embed = filter_(users_embed)
+                users_embed = modelD.encode(users_var,filter_)
                 group_embeds_list.append(users_embed)
 
     for group_embed in group_embeds_list:
@@ -259,6 +306,8 @@ def calc_attribute_bias(mode,args,modelD,experiment,\
             bias += weighted_bias / len(val)
     avg_bias = bias / len(movies)
     print("%s %s Bias is %f" %(mode,attribute,avg_bias))
+    if args.do_log:
+        experiment.log_metric(mode +" " + attribute + "Bias",float(avg_bias))
     return avg_bias
 
 def test(dataset, args, all_hash, modelD, subsample=1):
@@ -321,7 +370,7 @@ def test(dataset, args, all_hash, modelD, subsample=1):
 
     return l_ranks, r_ranks, avg_mr, avg_mrr, avg_h10, avg_h5
 
-def test_gcmc(dataset, args, modelD):
+def test_gcmc(dataset, args, modelD,filter_set=None):
     test_loader = DataLoader(dataset, batch_size=4000, num_workers=1, collate_fn=collate_fn)
     cst_inds = np.arange(args.num_ent, dtype=np.int64)[:,None]
     if args.show_tqdm:
@@ -335,7 +384,7 @@ def test_gcmc(dataset, args, modelD):
     for idx, p_batch in data_itr:
         p_batch_var = Variable(p_batch).cuda()
         lhs, rel, rhs = p_batch_var[:,0],p_batch_var[:,1],p_batch_var[:,2]
-        test_loss,preds = modelD(p_batch_var)
+        test_loss,preds = modelD(p_batch_var,filters=filter_set)
         rel += 1
         preds_list.append(preds.squeeze())
         rels_list.append(rel.float())
@@ -346,6 +395,38 @@ def test_gcmc(dataset, args, modelD):
     rms = torch.sqrt(F.mse_loss(total_preds.squeeze(),total_rels.squeeze()))
     return rms,test_loss
 
+def test_nce(dataset, args, modelD, epoch, experiment):
+    test_loader = DataLoader(dataset, batch_size=4000, num_workers=1, collate_fn=collate_fn)
+    cst_inds = np.arange(args.num_ent, dtype=np.int64)[:,None]
+    if args.show_tqdm:
+        data_itr = tqdm(enumerate(test_loader))
+    else:
+        data_itr = enumerate(test_loader)
+
+    probs_list= []
+    preds_list = []
+    rels_list =[]
+    correct = 0
+    for idx, p_batch in data_itr:
+        p_batch_var = Variable(p_batch).cuda()
+        lhs, rel, rhs = p_batch_var[:,0],p_batch_var[:,1],p_batch_var[:,2]
+        preds,weighted_preds,probs = modelD.predict(lhs,rhs)
+        probs_list.append(probs.squeeze())
+        preds_list.append(preds.squeeze())
+        correct += preds.eq(rel.view_as(preds)).sum().item()
+        rels_list.append((rel+1).float())
+    total_probs = torch.cat(probs_list)
+    total_preds = torch.cat(preds_list)
+    total_rels = torch.cat(rels_list)
+    rms = torch.sqrt(F.mse_loss(total_preds.squeeze().float(),\
+            total_rels.squeeze().float()))
+    AUC = multiclass_roc_auc_score(total_rels,total_probs)
+    acc = 100. * correct / len(dataset)
+    print("Test Model Accuracy is: %f AUC: %f" %(acc,AUC))
+    if args.do_log:
+        experiment.log_metric("Test Model RMSE",float(rms),step=epoch)
+        experiment.log_metric("Test Model AUC",float(AUC),step=epoch)
+        experiment.log_metric("Test Model Accuracy",float(acc),step=epoch)
 
 def train_fairness_classifier_gcmc(train_dataset,args,modelD,experiment,fairD,\
         fair_optim,epoch,filter_=None,retrain=False,log_freq=2):

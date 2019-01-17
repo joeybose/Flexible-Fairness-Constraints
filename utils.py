@@ -69,7 +69,7 @@ class NodeClassification(Dataset):
             self.dataset = self.dataset.cpu()
 
         data = self.dataset
-        np.random.shuffle(data)
+        # np.random.shuffle(data)
         data = np.ascontiguousarray(data)
         self.dataset = ltensor(data)
 

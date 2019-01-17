@@ -48,14 +48,15 @@ def parse_args():
     parser.add_argument('--remove_old_run', action='store_true', help="remove old run")
     parser.add_argument('--use_cross_entropy', action='store_true', help="DemPar Discriminators Loss as CE")
     parser.add_argument('--data_dir', type=str, default='./data/', help="Contains Pickle files")
+    parser.add_argument('--D_steps', type=int, default=5, help='Number of D steps')
     parser.add_argument('--num_epochs', type=int, default=10, help='Number of training epochs (default: 500)')
-    parser.add_argument('--num_classifier_epochs', type=int, default=10, help='Number of training epochs (default: 500)')
+    parser.add_argument('--num_classifier_epochs', type=int, default=100, help='Number of training epochs (default: 500)')
     parser.add_argument('--batch_size', type=int, default=8192, help='Batch size (default: 512)')
+    parser.add_argument('--dropout_p', type=float, default=0.2, help='Batch size (default: 512)')
     parser.add_argument('--gamma', type=int, default=1, help='Tradeoff for Adversarial Penalty')
     parser.add_argument('--valid_freq', type=int, default=99, help='Validate frequency in epochs (default: 50)')
     parser.add_argument('--print_freq', type=int, default=5, help='Print frequency in epochs (default: 5)')
-    parser.add_argument('--embed_dim', type=int, default=50, help='Embedding dimension (default: 50)')
-    parser.add_argument('--z_dim', type=int, default=100, help='noise Embedding dimension (default: 100)')
+    parser.add_argument('--embed_dim', type=int, default=20, help='Embedding dimension (default: 50)')
     parser.add_argument('--lr', type=float, default=0.01, help='Learning rate (default: 0.001)')
     parser.add_argument('--margin', type=float, default=3, help='Loss margin (default: 1)')
     parser.add_argument('--p', type=int, default=1, help='P value for p-norm (default: 1)')
@@ -146,8 +147,8 @@ def main(args):
                         ,project_name="graph-invariance", workspace="joeybose")
     experiment.set_name(args.namestr)
     if not args.use_gcmc:
-        modelD = TransD(args.num_ent, args.num_rel, args.embed_dim,\
-                args.p).to(args.device)
+        # modelD = TransD(args.num_ent, args.num_rel, args.embed_dim,\
+                # args.p).to(args.device)
         modelD = TransE(args.num_ent, args.num_rel, args.embed_dim,\
                 args.p).to(args.device)
     else:
@@ -261,49 +262,53 @@ def main(args):
     if not args.dont_train:
         with experiment.train():
             for epoch in tqdm(range(1, args.num_epochs + 1)):
-                train(train_loader,epoch,args,train_hash,modelD,optimizerD,\
-                        fairD_set,optimizer_fairD_set,filter_set,experiment)
-                gc.collect()
 
-                if epoch % args.valid_freq == 0:
+                if epoch % args.valid_freq == 0 or epoch == 1:
                     with torch.no_grad():
                         if args.use_gcmc:
-                            rmse,test_loss = test_gcmc(test_set, args, modelD)
+                            rmse,test_loss = test_gcmc(test_set,args,modelD,filter_set)
                         else:
-                            l_ranks,r_ranks,avg_mr,avg_mrr,avg_h10,avg_h5 = test(test_set, args, all_hash,\
-                                    modelD,subsample=20)
+                            # l_ranks,r_ranks,avg_mr,avg_mrr,avg_h10,avg_h5 = test(test_set, args, all_hash,\
+                                    # modelD,subsample=20)
+                            test_nce(test_set,args,modelD,epoch,experiment)
 
                     if args.use_attr:
-                        test_gender(args,test_fairness_set,modelD,fairD_gender,experiment,epoch)
-                        test_occupation(args,test_fairness_set,modelD,fairD_occupation,experiment,epoch)
-                        test_age(args,test_fairness_set,modelD,fairD_age,experiment,epoch)
+                        test_gender(args,test_fairness_set,modelD,fairD_gender,experiment,epoch,filter_set)
+                        test_occupation(args,test_fairness_set,modelD,fairD_occupation,experiment,epoch,filter_set)
+                        test_age(args,test_fairness_set,modelD,fairD_age,experiment,epoch,filter_set)
                     elif args.use_gender_attr:
-                        test_gender(args,test_fairness_set,modelD,fairD_gender,experiment,epoch)
+                        test_gender(args,test_fairness_set,modelD,fairD_gender,experiment,epoch,filter_set)
                     elif args.use_occ_attr:
-                        test_occupation(args,test_fairness_set,modelD,fairD_occupation,experiment,epoch)
+                        test_occupation(args,test_fairness_set,modelD,fairD_occupation,experiment,epoch,filter_set)
                     elif args.use_age_attr:
-                        test_age(args,test_fairness_set,modelD,fairD_age,experiment,epoch)
+                        test_age(args,test_fairness_set,modelD,fairD_age,experiment,epoch,filter_set)
                     elif args.use_random_attr:
                         test_fairness(test_fairness_set,args,modelD,experiment,\
-                                fairD_random,attribute='random', epoch=epoch)
+                                fairD_random,attribute='random',\
+                                epoch=epoch)
 
                     if args.do_log: # Tensorboard logging
                         if args.use_gcmc:
                             experiment.log_metric("RMSE",float(rmse),step=epoch)
                             experiment.log_metric("Test Loss",float(rmse),step=epoch)
-                        else:
-                            experiment.log_metric("Mean Rank",float(avg_mr),step=epoch)
-                            experiment.log_metric("Mean Reciprocal Rank",\
-                                    float(avg_mrr),step=epoch)
-                            experiment.log_metric("Hit @10",float(avg_h10),step=epoch)
-                            experiment.log_metric("Hit @5",float(avg_h5),step=epoch)
+                        # else:
+                            # experiment.log_metric("Mean Rank",float(avg_mr),step=epoch)
+                            # experiment.log_metric("Mean Reciprocal Rank",\
+                                    # float(avg_mrr),step=epoch)
+                            # experiment.log_metric("Hit @10",float(avg_h10),step=epoch)
+                            # experiment.log_metric("Hit @5",float(avg_h5),step=epoch)
+
+                train(train_loader,epoch,args,train_hash,modelD,optimizerD,\
+                        fairD_set,optimizer_fairD_set,filter_set,experiment)
+                gc.collect()
 
                 if epoch % (args.valid_freq * 5) == 0:
                     if args.use_gcmc:
                         rmse = test_gcmc(test_set, args, modelD)
                     else:
-                        l_ranks,r_ranks,avg_mr,avg_mrr,avg_h10,avg_h5 = test(test_set,args, all_hash,\
-                                modelD,subsample=20)
+                        test_nce(test_set,args,modelD,epoch,experiment)
+                        # l_ranks,r_ranks,avg_mr,avg_mrr,avg_h10,avg_h5 = test(test_set,args, all_hash,\
+                                # modelD,subsample=20)
         # if not args.use_gcmc:
             # l_ranks,r_ranks,avg_mr,avg_mrr,avg_h10,avg_h5 = test(test_set,args, all_hash, modelD)
             # joblib.dump({'l_ranks':l_ranks, 'r_ranks':r_ranks}, args.outname_base+'test_ranks.pkl', compress=9)
@@ -340,29 +345,30 @@ def main(args):
             ''' Train Classifier '''
             if args.use_gender_attr or args.use_attr:
                 train_gender(args,modelD,train_fairness_set,test_fairness_set,\
-                        attr_data,experiment)
+                        attr_data,experiment,filter_set)
             if args.use_occ_attr or args.use_attr:
                 train_occupation(args,modelD,train_fairness_set,test_fairness_set,\
-                        attr_data,experiment)
+                        attr_data,experiment,filter_set)
             if args.use_age_attr or args.use_attr:
-                train_age(args,modelD,train_fairness_set,test_fairness_set,attr_data,experiment)
+                train_age(args,modelD,train_fairness_set,test_fairness_set,\
+                        attr_data,experiment,filter_set)
             if args.use_random_attr:
                 train_fairness_classifier(train_fairness_set,args,modelD,experiment,new_fairD_random,\
                         new_optimizer_fairD_random,epoch,filter_=None,retrain=False)
 
         if args.report_bias:
             gender_bias = calc_attribute_bias('Train',args,modelD,experiment,\
-                    'gender',epoch,gender_filter)
+                    'gender',epoch,[gender_filter])
             occ_bias = calc_attribute_bias('Train',args,modelD,experiment,\
-                    'occupation',epoch,gender_filter)
+                    'occupation',epoch,[occupation_filter])
             age_bias = calc_attribute_bias('Train',args,modelD,experiment,\
-                    'age',epoch,gender_filter)
+                    'age',epoch,[age_filter])
             gender_bias = calc_attribute_bias('Test',args,modelD,experiment,\
-                    'gender',epoch,gender_filter)
+                    'gender',epoch,[gender_filter])
             occ_bias = calc_attribute_bias('Test',args,modelD,experiment,\
-                    'occupation',epoch,gender_filter)
+                    'occupation',epoch,[occupation_filter])
             age_bias = calc_attribute_bias('Test',args,modelD,experiment,\
-                    'age',epoch,gender_filter)
+                    'age',epoch,[age_filter])
         experiment.end()
 
 if __name__ == '__main__':
