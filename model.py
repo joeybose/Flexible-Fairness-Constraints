@@ -36,6 +36,14 @@ ltensor = torch.LongTensor
 v2np = lambda v: v.data.cpu().numpy()
 USE_SPARSE_EMB = True
 
+def apply_filters_gcmc(p_lhs_emb,masked_filter_set):
+    ''' Doesnt Have Masked Filters yet '''
+    filter_l_emb, filter_r_emb = 0,0
+    for filter_ in masked_filter_set:
+        if filter_ is not None:
+            filter_l_emb += filter_(p_lhs_emb)
+    return filter_l_emb
+
 class RedditEncoder(nn.Module):
     def __init__(self, num_users, num_sr, embed_dim, p):
         super(RedditEncoder, self).__init__()
@@ -56,7 +64,7 @@ class RedditEncoder(nn.Module):
     def forward(self, batch, return_ent_emb=False):
         users, sr = batch[:,0],batch[:,1]
         users_embed, sr_embed = self.encode(users,sr)
-        enrgs = (users_embed*sr_embed).sum(dim=1)
+        enrgs = -1*(users_embed*sr_embed).sum(dim=1)
         if not return_ent_emb:
             return enrgs
         else:
@@ -119,21 +127,26 @@ class TransE(nn.Module):
         ent_embed = self.ent_embeds(ents)
         return ent_embed
 
-    def predict(self,embeds1,embeds2):
-        energs_list = []
-        for i in range(0,self.num_weights):
-            index = Variable(torch.LongTensor([i)).cuda()
-            rel_es = self.rel_embeds(index)
-            enrgs = (embeds1 + rel_es - embeds2).norm(p=self.p, dim=1)
-            energs_list.append(enrgs)
-        enrgs_outputs = torch.stack(energs_list,dim=1)
-        outputs = F.log_softmax(enrgs_outputs,dim=1)
-        preds = 0
-        for j in range(0,self.num_relations):
-            index = Variable(torch.LongTensor([j])).cuda()
-            ''' j+1 because of zero index '''
-            preds += (j+1)*torch.exp(torch.index_select(outputs, 1,index))
-        return preds
+    def predict(self,heads,tails):
+        with torch.no_grad():
+            embeds1 = self.encode(heads)
+            embeds2 = self.encode(tails)
+            energs_list = []
+            for i in range(0,self.num_rel):
+                index = Variable(torch.LongTensor([i])).cuda()
+                rel_es = self.rel_embeds(index)
+                enrgs = (embeds1 + rel_es - embeds2).norm(p=self.p, dim=1)
+                energs_list.append(enrgs)
+            enrgs_outputs = torch.stack(energs_list,dim=1)
+            outputs = F.log_softmax(enrgs_outputs,dim=1)
+            probs = torch.exp(outputs)
+            preds = outputs.max(1, keepdim=True)[1] # get the index of the max
+            weighted_preds = 0
+            for j in range(0,self.num_rel):
+                index = Variable(torch.LongTensor([j])).cuda()
+                ''' j+1 because of zero index '''
+                weighted_preds+= (j+1)*torch.exp(torch.index_select(outputs, 1,index))
+        return preds,weighted_preds,probs
 
     def save(self, fn):
         torch.save(self.state_dict(), fn)
@@ -373,22 +386,31 @@ class SimpleGCMC(nn.Module):
         else:
             self.encoder = encoder
 
-    def encode(self, nodes):
-        # return self.attr_filter(self.embeddings(nodes), active_attrs)
+    def encode(self, nodes, filters=None):
         embs = self.encoder(nodes)
         embs = self.batchnorm(embs)
+        if filters is not None:
+            constant = len(filters) - filters.count(None)
+            if constant !=0:
+                embs = apply_filters_gcmc(embs,filters)
         return embs
 
-    def predict_rel(self,heads,tails_embed,filter_=None):
+    def predict_rel(self,heads,tails_embed,filters=None):
         with torch.no_grad():
             head_embeds = self.encode(heads)
-            if filter_ is not None:
-                head_embeds = filter_(pos_head_embeds)
+            if filters is not None:
+                constant = len(filters) - filters.count(None)
+                if constant !=0:
+                    head_embeds = apply_filters_gcmc(head_embeds,filters)
             preds = self.decoder.predict(head_embeds,tail_embeds)
         return preds
 
-    def forward(self, pos_edges, weights=None, return_embeds=False):
+    def forward(self, pos_edges, weights=None, return_embeds=False, filters=None):
         pos_head_embeds = self.encode(pos_edges[:,0])
+        if filters is not None:
+            constant = len(filters) - filters.count(None)
+            if constant !=0:
+                pos_head_embeds = apply_filters_gcmc(pos_head_embeds,filters)
         pos_tail_embeds = self.encode(pos_edges[:,-1])
         rels = pos_edges[:,1]
         loss, preds = self.decoder(pos_head_embeds, pos_tail_embeds, rels)
@@ -396,6 +418,78 @@ class SimpleGCMC(nn.Module):
             return loss, preds, pos_head_embeds, pos_tail_embeds
         else:
             return loss, preds
+
+    def save(self, fn):
+        torch.save(self.state_dict(), fn)
+
+    def load(self, fn):
+        self.load_state_dict(torch.load(fn))
+
+class RandomDiscriminator(nn.Module):
+    def __init__(self,use_1M,embed_dim,attribute_data,attribute,use_cross_entropy=True):
+        super(RandomDiscriminator, self).__init__()
+        self.embed_dim = int(embed_dim)
+        self.attribute_data = attribute_data
+        self.attribute = attribute
+        if use_cross_entropy:
+            self.cross_entropy = True
+        else:
+            self.cross_entropy = False
+
+        users_random = attribute_data[0]['rand']
+        self.users_sensitive = np.ascontiguousarray(users_random)
+        self.out_dim = 1
+        self.sigmoid = nn.Sigmoid()
+        self.criterion = nn.BCELoss()
+
+        self.net = nn.Sequential(
+            nn.Linear(self.embed_dim, int(self.embed_dim * 2 ), bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim * 2), int(self.embed_dim*4),bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim * 4), int(self.embed_dim*4),bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim * 4), int(self.embed_dim*2),bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim * 2), int(self.embed_dim*2),bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim*2), int(self.embed_dim), bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim), int(self.embed_dim), bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim), int(self.embed_dim/2), bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim / 2), self.out_dim,bias=True)
+            )
+
+    def forward(self, ents_emb, ents, return_loss=False):
+        scores = self.net(ents_emb)
+        output = self.sigmoid(scores)
+        A_labels = Variable(torch.FloatTensor(self.users_sensitive[ents.cpu()])).cuda()
+        if return_loss:
+            loss = self.criterion(output.squeeze(), A_labels)
+            return loss
+        else:
+            return output.squeeze(),A_labels
+
+    def predict(self, ents_emb, ents, return_preds=False):
+        with torch.no_grad():
+            scores = self.net(ents_emb)
+            output = self.sigmoid(scores)
+            A_labels = Variable(torch.FloatTensor(self.users_sensitive[ents.cpu()])).cuda()
+            preds = (output > torch.Tensor([0.5]).cuda()).float() * 1
+        if return_preds:
+            return output.squeeze(),A_labels,preds
+        else:
+            return output.squeeze(),A_labels
 
     def save(self, fn):
         torch.save(self.state_dict(), fn)
@@ -422,23 +516,40 @@ class GenderDiscriminator(nn.Module):
         self.criterion = nn.BCELoss()
 
         self.net = nn.Sequential(
-            nn.Linear(self.embed_dim, int(self.embed_dim * 4 ), bias=True),
+            nn.Linear(self.embed_dim, int(self.embed_dim * 2 ), bias=True),
+            # nn.BatchNorm1d(num_features=self.embed_dim * 4),
             nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim * 2), int(self.embed_dim*4),bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim * 4), int(self.embed_dim*4),bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
             nn.Linear(int(self.embed_dim * 4), int(self.embed_dim*2),bias=True),
+            # nn.BatchNorm1d(num_features=self.embed_dim * 2),
             nn.LeakyReLU(0.2),
-            # # nn.Linear(int(self.embed_dim * 8), int(self.embed_dim*2),bias=True),
-            # # nn.LeakyReLU(0.2),
-            nn.Linear(int(self.embed_dim * 2), int(self.embed_dim),bias=True),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim * 2), int(self.embed_dim*2),bias=True),
+            # nn.BatchNorm1d(num_features=self.embed_dim),
             nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim*2), int(self.embed_dim), bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim), int(self.embed_dim), bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
             nn.Linear(int(self.embed_dim), int(self.embed_dim/2), bias=True),
             nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
             nn.Linear(int(self.embed_dim / 2), self.out_dim,bias=True)
             )
 
     def forward(self, ents_emb, ents, return_loss=False):
         scores = self.net(ents_emb)
         output = self.sigmoid(scores)
-        A_labels = Variable(torch.FloatTensor(self.users_sensitive[ents])).cuda()
+        A_labels = Variable(torch.FloatTensor(self.users_sensitive[ents.cpu()])).cuda()
         if return_loss:
             loss = self.criterion(output.squeeze(), A_labels)
             return loss
@@ -449,7 +560,7 @@ class GenderDiscriminator(nn.Module):
         with torch.no_grad():
             scores = self.net(ents_emb)
             output = self.sigmoid(scores)
-            A_labels = Variable(torch.FloatTensor(self.users_sensitive[ents])).cuda()
+            A_labels = Variable(torch.FloatTensor(self.users_sensitive[ents.cpu()])).cuda()
             preds = (output > torch.Tensor([0.5]).cuda()).float() * 1
         if return_preds:
             return output.squeeze(),A_labels,preds
@@ -488,23 +599,37 @@ class AgeDiscriminator(nn.Module):
             self.out_dim = 7
 
         self.net = nn.Sequential(
-            nn.Linear(self.embed_dim, int(self.embed_dim * 4 ), bias=True),
+            nn.Linear(self.embed_dim, int(self.embed_dim * 2 ), bias=True),
+            # nn.BatchNorm1d(num_features=self.embed_dim * 4),
             nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim * 2), int(self.embed_dim*4),bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
             nn.Linear(int(self.embed_dim * 4), int(self.embed_dim*2),bias=True),
+            # nn.BatchNorm1d(num_features=self.embed_dim * 2),
             nn.LeakyReLU(0.2),
-            # # nn.Linear(int(self.embed_dim * 8), int(self.embed_dim*2),bias=True),
-            # # nn.LeakyReLU(0.2),
-            nn.Linear(int(self.embed_dim * 2), int(self.embed_dim),bias=True),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim * 2), int(self.embed_dim*2),bias=True),
+            # nn.BatchNorm1d(num_features=self.embed_dim),
             nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim*2), int(self.embed_dim), bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim), int(self.embed_dim), bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
             nn.Linear(int(self.embed_dim), int(self.embed_dim/2), bias=True),
             nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
             nn.Linear(int(self.embed_dim / 2), self.out_dim,bias=True)
             )
 
     def forward(self, ents_emb, ents, return_loss=False):
         scores = self.net(ents_emb)
         output = F.log_softmax(scores, dim=1)
-        A_labels = Variable(torch.LongTensor(self.users_sensitive[ents])).cuda()
+        A_labels = Variable(torch.LongTensor(self.users_sensitive[ents.cpu()])).cuda()
         if return_loss:
             loss = self.criterion(output.squeeze(), A_labels)
             return loss
@@ -515,7 +640,7 @@ class AgeDiscriminator(nn.Module):
         with torch.no_grad():
             scores = self.net(ents_emb)
             output = F.log_softmax(scores, dim=1)
-            A_labels = Variable(torch.LongTensor(self.users_sensitive[ents])).cuda()
+            A_labels = Variable(torch.LongTensor(self.users_sensitive[ents.cpu()])).cuda()
             preds = output.max(1, keepdim=True)[1] # get the index of the max
         if return_preds:
             return output.squeeze(),A_labels,preds
@@ -554,23 +679,34 @@ class OccupationDiscriminator(nn.Module):
             self.out_dim = len(users_occupation_list)
 
         self.net = nn.Sequential(
-            nn.Linear(self.embed_dim, int(self.embed_dim * 4 ), bias=True),
+            nn.Linear(self.embed_dim, int(self.embed_dim *2 ), bias=True),
+            # nn.BatchNorm1d(num_features=self.embed_dim * 4),
             nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim * 2), int(self.embed_dim*4),bias=True),
+            # nn.BatchNorm1d(num_features=self.embed_dim * 2),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
             nn.Linear(int(self.embed_dim * 4), int(self.embed_dim*2),bias=True),
+            # nn.BatchNorm1d(num_features=self.embed_dim),
             nn.LeakyReLU(0.2),
-            # # nn.Linear(int(self.embed_dim * 8), int(self.embed_dim*2),bias=True),
-            # # nn.LeakyReLU(0.2),
-            nn.Linear(int(self.embed_dim * 2), int(self.embed_dim),bias=True),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim*2), int(self.embed_dim*2), bias=True),
             nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim*2), int(self.embed_dim), bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
             nn.Linear(int(self.embed_dim), int(self.embed_dim/2), bias=True),
             nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
             nn.Linear(int(self.embed_dim / 2), self.out_dim,bias=True)
             )
 
     def forward(self, ents_emb, ents, return_loss=False):
         scores = self.net(ents_emb)
         output = F.log_softmax(scores, dim=1)
-        A_labels = Variable(torch.LongTensor(self.users_sensitive[ents])).cuda()
+        A_labels = Variable(torch.LongTensor(self.users_sensitive[ents.cpu()])).cuda()
         if return_loss:
             loss = self.criterion(output.squeeze(), A_labels)
             return loss
@@ -581,7 +717,7 @@ class OccupationDiscriminator(nn.Module):
         with torch.no_grad():
             scores = self.net(ents_emb)
             output = F.log_softmax(scores, dim=1)
-            A_labels = Variable(torch.LongTensor(self.users_sensitive[ents])).cuda()
+            A_labels = Variable(torch.LongTensor(self.users_sensitive[ents.cpu()])).cuda()
             preds = output.max(1, keepdim=True)[1] # get the index of the max
         if return_preds:
             return output.squeeze(),A_labels,preds

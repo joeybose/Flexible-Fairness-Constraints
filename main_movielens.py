@@ -48,7 +48,7 @@ def parse_args():
     parser.add_argument('--remove_old_run', action='store_true', help="remove old run")
     parser.add_argument('--use_cross_entropy', action='store_true', help="DemPar Discriminators Loss as CE")
     parser.add_argument('--data_dir', type=str, default='./data/', help="Contains Pickle files")
-    parser.add_argument('--D_steps', type=int, default=5, help='Number of D steps')
+    parser.add_argument('--D_steps', type=int, default=10, help='Number of D steps')
     parser.add_argument('--num_epochs', type=int, default=10, help='Number of training epochs (default: 500)')
     parser.add_argument('--num_classifier_epochs', type=int, default=100, help='Number of training epochs (default: 500)')
     parser.add_argument('--batch_size', type=int, default=8192, help='Batch size (default: 512)')
@@ -144,7 +144,7 @@ def main(args):
 
     ''' Comet Logging '''
     experiment = Experiment(api_key="Ht9lkWvTm58fRo9ccgpabq5zV", disabled= not args.do_log
-                        ,project_name="graph-invariance", workspace="joeybose")
+                        ,project_name="graph-invariance-icml", workspace="joeybose")
     experiment.set_name(args.namestr)
     if not args.use_gcmc:
         # modelD = TransD(args.num_ent, args.num_rel, args.embed_dim,\
@@ -169,6 +169,8 @@ def main(args):
                 attribute='occupation',use_cross_entropy=args.use_cross_entropy)
         fairD_age = AgeDiscriminator(args.use_1M,args.embed_dim,attr_data,\
                 attribute='age',use_cross_entropy=args.use_cross_entropy)
+        fairD_random = RandomDiscriminator(args.use_1M,args.embed_dim,attr_data,\
+                'random',use_cross_entropy=args.use_cross_entropy).to(args.device)
         # fairD_random = DemParDisc2(args.use_1M,args.embed_dim,attr_data,\
                 # attribute='random',use_cross_entropy=args.use_cross_entropy)
 
@@ -207,8 +209,10 @@ def main(args):
         optimizer_fairD_age = optimizer(fairD_age.parameters(),'adam', args.lr)
     elif args.use_random_attr:
         attr_data = [args.users,args.movies]
-        fairD_random = DemParDisc(args.use_1M,args.embed_dim,attr_data,\
-                attribute='random',use_cross_entropy=args.use_cross_entropy)
+        fairD_random = RandomDiscriminator(args.use_1M,args.embed_dim,attr_data,\
+                'random',use_cross_entropy=args.use_cross_entropy).to(args.device)
+        # fairD_random = DemParDisc(args.use_1M,args.embed_dim,attr_data,\
+                # attribute='random',use_cross_entropy=args.use_cross_entropy)
         optimizer_fairD_random = optimizer(fairD_random.parameters(),'adam', args.lr)
 
     if args.load_transD:
@@ -283,9 +287,10 @@ def main(args):
                     elif args.use_age_attr:
                         test_age(args,test_fairness_set,modelD,fairD_age,experiment,epoch,filter_set)
                     elif args.use_random_attr:
-                        test_fairness(test_fairness_set,args,modelD,experiment,\
-                                fairD_random,attribute='random',\
-                                epoch=epoch)
+                        test_random(args,test_fairness_set,modelD,fairD_random,experiment,epoch,filter_set)
+                        # test_fairness(test_fairness_set,args,modelD,experiment,\
+                                # fairD_random,attribute='random',\
+                                # epoch=epoch)
 
                     if args.do_log: # Tensorboard logging
                         if args.use_gcmc:
@@ -353,8 +358,10 @@ def main(args):
                 train_age(args,modelD,train_fairness_set,test_fairness_set,\
                         attr_data,experiment,filter_set)
             if args.use_random_attr:
-                train_fairness_classifier(train_fairness_set,args,modelD,experiment,new_fairD_random,\
-                        new_optimizer_fairD_random,epoch,filter_=None,retrain=False)
+                train_random(args,modelD,train_fairness_set,test_fairness_set,\
+                        attr_data,experiment,filter_set)
+                # train_fairness_classifier(train_fairness_set,args,modelD,experiment,new_fairD_random,\
+                        # new_optimizer_fairD_random,epoch,filter_=None,retrain=False)
 
         if args.report_bias:
             gender_bias = calc_attribute_bias('Train',args,modelD,experiment,\
