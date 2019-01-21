@@ -169,25 +169,21 @@ def main(args):
                 attribute='occupation',use_cross_entropy=args.use_cross_entropy)
         fairD_age = AgeDiscriminator(args.use_1M,args.embed_dim,attr_data,\
                 attribute='age',use_cross_entropy=args.use_cross_entropy)
-        fairD_random = RandomDiscriminator(args.use_1M,args.embed_dim,attr_data,\
-                'random',use_cross_entropy=args.use_cross_entropy).to(args.device)
-        # fairD_random = DemParDisc2(args.use_1M,args.embed_dim,attr_data,\
-                # attribute='random',use_cross_entropy=args.use_cross_entropy)
 
         ''' Initialize Optimizers '''
         if args.sample_mask:
             gender_filter = AttributeFilter(args.embed_dim,attribute='gender').to(args.device)
             occupation_filter = AttributeFilter(args.embed_dim,attribute='occupation').to(args.device)
             age_filter = AttributeFilter(args.embed_dim,attribute='age').to(args.device)
-            if not args.use_trained_filters:
-                ''' Optimize the Filters oth. it's Pretrained '''
-                optimizer_fairD_gender = optimizer(list(fairD_gender.parameters()) + \
-                        list(gender_filter.parameters()),'adam', args.lr)
-                optimizer_fairD_occupation = optimizer(list(fairD_occupation.parameters()) + \
-                        list(occupation_filter.parameters()),'adam',args.lr)
-                optimizer_fairD_age = optimizer(list(fairD_age.parameters()) + \
-                        list(age_filter.parameters()),'adam', args.lr)
-        else:
+            # if not args.use_trained_filters:
+                # ''' Optimize the Filters oth. it's Pretrained '''
+                # optimizer_fairD_gender = optimizer(list(fairD_gender.parameters()) + \
+                        # list(gender_filter.parameters()),'adam', args.lr)
+                # optimizer_fairD_occupation = optimizer(list(fairD_occupation.parameters()) + \
+                        # list(occupation_filter.parameters()),'adam',args.lr)
+                # optimizer_fairD_age = optimizer(list(fairD_age.parameters()) + \
+                        # list(age_filter.parameters()),'adam', args.lr)
+        # else:
             optimizer_fairD_gender = optimizer(fairD_gender.parameters(),'adam', args.lr)
             optimizer_fairD_occupation = optimizer(fairD_occupation.parameters(),'adam',args.lr)
             optimizer_fairD_age = optimizer(fairD_age.parameters(),'adam', args.lr)
@@ -238,7 +234,15 @@ def main(args):
                 filter_.to(args.device)
 
     if args.use_gcmc:
-        optimizerD = optimizer(modelD.parameters(), 'adam', args.lr)
+        if args.sample_mask and not args.use_trained_filters:
+            optimizerD = optimizer(list(modelD.parameters()) + \
+                    list(gender_filter.parameters()) + \
+                    list(occupation_filter.parameters()) + \
+                    list(age_filter.parameters()), 'adam', args.lr)
+            # optimizer_fairD_gender = optimizer(list(fairD_gender.parameters()) + \
+                    # list(gender_filter.parameters()),'adam', args.lr)
+        else:
+            optimizerD = optimizer(modelD.parameters(), 'adam', args.lr)
     else:
         optimizerD = optimizer(modelD.parameters(), 'adam_sparse', args.lr)
 

@@ -34,11 +34,19 @@ from collections import OrderedDict
 ftensor = torch.FloatTensor
 ltensor = torch.LongTensor
 v2np = lambda v: v.data.cpu().numpy()
-USE_SPARSE_EMB = True
+USE_SPARSE_EMB = False
 
 def apply_filters_gcmc(p_lhs_emb,masked_filter_set):
     ''' Doesnt Have Masked Filters yet '''
     filter_l_emb, filter_r_emb = 0,0
+    for filter_ in masked_filter_set:
+        if filter_ is not None:
+            filter_l_emb += filter_(p_lhs_emb)
+    return filter_l_emb
+
+def apply_filters_reddit(p_lhs_emb,masked_filter_set):
+    ''' Doesnt Have Masked Filters yet '''
+    filter_l_emb = 0
     for filter_ in masked_filter_set:
         if filter_ is not None:
             filter_l_emb += filter_(p_lhs_emb)
@@ -58,27 +66,115 @@ class RedditEncoder(nn.Module):
         self.sr_embeds = nn.Embedding(self.num_sr,self.embed_dim, \
                 max_norm=1, norm_type=2, sparse=USE_SPARSE_EMB)
 
-        self.user_embeds.weight.data.uniform_(-r, r)#.renorm_(p=2, dim=1, maxnorm=1)
-        self.sr_embeds.weight.data.uniform_(-r, r)#.renorm_(p=2, dim=1, maxnorm=1)
+        self.user_embeds.weight.data.uniform_(-r, r)
+        self.sr_embeds.weight.data.uniform_(-r, r)
 
-    def forward(self, batch, return_ent_emb=False):
+    def forward(self, batch, return_ent_emb=False, filters=None):
         users, sr = batch[:,0],batch[:,1]
-        users_embed, sr_embed = self.encode(users,sr)
+        users_embed, sr_embed = self.encode(users,sr,filters)
         enrgs = -1*(users_embed*sr_embed).sum(dim=1)
         if not return_ent_emb:
             return enrgs
         else:
             return enrgs,users_embed,sr_embed
 
-    def get_embed(self, users, sr):
+    def get_embed(self, users, filters=None):
+        with torch.no_grad():
+            user_embed = self.user_embeds(users)
+            if filters is not None:
+                constant = len(filters) - filters.count(None)
+                if constant !=0:
+                    user_embed = apply_filters_reddit(user_embed,filters)
+        return user_embed
+
+    def encode(self, users, sr, filters=None):
         user_embed = self.user_embeds(users)
+        if filters is not None:
+            constant = len(filters) - filters.count(None)
+            if constant !=0:
+                user_embed = apply_filters_reddit(user_embed,filters)
         sr_embed = self.sr_embeds(sr)
         return user_embed, sr_embed
 
-    def encode(self, users, sr):
-        user_embed = self.user_embeds(users)
-        sr_embed = self.sr_embeds(sr)
-        return user_embed, sr_embed
+    def save(self, fn):
+        torch.save(self.state_dict(), fn)
+
+    def load(self, fn):
+        self.load_state_dict(torch.load(fn))
+
+class RedditDiscriminator(nn.Module):
+    def __init__(self,G,embed_dim,sensitive_sr,u_to_idx,use_cross_entropy=True):
+        super(RedditDiscriminator, self).__init__()
+        self.embed_dim = int(embed_dim)
+        self.u_to_idx = u_to_idx
+        self.G_neighbors = set(G.neighbors(sensitive_sr))
+        self.attribute = sensitive_sr
+        if use_cross_entropy:
+            self.cross_entropy = True
+        else:
+            self.cross_entropy = False
+
+        self.users_sensitive = self.create_sensitive_labels(self.G_neighbors,self.u_to_idx)
+        self.out_dim = 1
+        self.sigmoid = nn.Sigmoid()
+        self.criterion = nn.BCELoss()
+        self.num_correct = 0
+
+        self.net = nn.Sequential(
+            nn.Linear(self.embed_dim, int(self.embed_dim * 2 ), bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim * 2), int(self.embed_dim*4),bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim * 4), int(self.embed_dim*4),bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim * 4), int(self.embed_dim*2),bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim * 2), int(self.embed_dim*2),bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim*2), int(self.embed_dim), bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim), int(self.embed_dim), bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim), int(self.embed_dim/2), bias=True),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(p=0.3),
+            nn.Linear(int(self.embed_dim / 2), self.out_dim,bias=True)
+            )
+
+    def create_sensitive_labels(self,neighbor_users,u_to_idx):
+        filtered_neighbors = [n for n in neighbor_users if n.split('_')[0] == 'U']
+        sensitive_users = [u_to_idx[user] for user in filtered_neighbors]
+        all_users_attr = np.zeros(len(u_to_idx))
+        all_users_attr[np.asarray(sensitive_users)] = 1
+        return all_users_attr
+
+    def forward(self, ents_emb, ents, return_loss=False):
+        scores = self.net(ents_emb)
+        output = self.sigmoid(scores)
+        A_labels = Variable(torch.FloatTensor(self.users_sensitive[ents.cpu()])).cuda()
+        if return_loss:
+            loss = self.criterion(output.squeeze(), A_labels)
+            return loss
+        else:
+            return output.squeeze(),A_labels
+
+    def predict(self, ents_emb, ents, return_preds=False):
+        with torch.no_grad():
+            scores = self.net(ents_emb)
+            output = self.sigmoid(scores)
+            A_labels = Variable(torch.FloatTensor(self.users_sensitive[ents.cpu()])).cuda()
+            preds = (output > torch.Tensor([0.5]).cuda()).float() * 1
+        if return_preds:
+            return output.squeeze(),A_labels,preds
+        else:
+            return output.squeeze(),A_labels
 
     def save(self, fn):
         torch.save(self.state_dict(), fn)
@@ -282,10 +378,12 @@ class AttributeFilter(nn.Module):
         self.attribute = attribute
         self.W1 = nn.Linear(self.embed_dim, int(self.embed_dim * 2), bias=True)
         self.W2 = nn.Linear(int(self.embed_dim * 2), int(self.embed_dim), bias=True)
+        self.batchnorm = nn.BatchNorm1d(self.embed_dim)
 
     def forward(self, ents_emb):
         h1 = F.leaky_relu(self.W1(ents_emb))
         h2 = F.leaky_relu(self.W2(h1))
+        h2 = self.batchnorm(h2)
         return h2
 
     def save(self, fn):

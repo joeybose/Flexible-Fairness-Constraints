@@ -15,6 +15,7 @@ from sklearn.metrics import precision_recall_fscore_support
 from sklearn.metrics import roc_auc_score, accuracy_score
 from sklearn.metrics import f1_score
 from sklearn import preprocessing
+from sklearn.dummy import DummyClassifier
 import numpy as np
 import random
 import argparse
@@ -71,6 +72,35 @@ def multiclass_roc_auc_score(y_test, y_pred, average="micro"):
     lb.fit(y_test)
     y_test = lb.transform(y_test)
     return roc_auc_score(y_test, y_pred, average=average)
+
+def test_dummy(args,test_dataset,modelD,net,dummy,experiment,\
+        epoch,strategy,multi_class=False,filter_set=None):
+    test_loader = DataLoader(test_dataset, num_workers=1, batch_size=604)
+    correct = 0
+    preds_list, probs_list, labels_list = [], [],[]
+    sensitive_attr = net.users_sensitive
+    for p_batch in test_loader:
+        p_batch_var = Variable(p_batch).cuda()
+        p_batch_emb = modelD.encode(p_batch_var.detach(),filter_set)
+        y = sensitive_attr[p_batch]
+        preds = dummy.predict(p_batch_emb)
+        acc = 100.* accuracy_score(y,preds)
+        preds_list.append(preds)
+        if multi_class:
+            probs_list.append(dummy.predict_proba(p_batch_emb))
+        else:
+            probs_list.append(dummy.predict_proba(p_batch_emb)[:, 1])
+        labels_list.append(y)
+    if multi_class:
+        AUC = multiclass_roc_auc_score(labels_list[0],probs_list[0])
+    else:
+        AUC = roc_auc_score(labels_list[0],probs_list[0],average="micro")
+    f1 = f1_score(labels_list[0],preds_list[0],average="micro")
+    print("Test Dummy %s Accuracy is: %f AUC: %f F1: %f" %(strategy,acc,AUC,f1))
+    if args.do_log:
+        experiment.log_metric("Test Dummy "+strategy+net.attribute+" AUC",float(AUC),step=epoch)
+        experiment.log_metric("Test Dummy "+strategy+net.attribute+" Accuracy",float(acc),step=epoch)
+        experiment.log_metric("Test Dummy "+strategy+net.attribute+" F1",float(f1),step=epoch)
 
 def test_random(args,test_dataset,modelD,net,experiment,\
         epoch,filter_set=None):
@@ -138,7 +168,7 @@ def test_gender(args,test_dataset,modelD,net,experiment,\
         epoch,filter_set=None):
     test_loader = DataLoader(test_dataset, num_workers=1, batch_size=512)
     correct = 0
-    preds_list, probs_list, labels_list = [], [],[]
+    preds_list, probs_list, labels_list  = [], [], []
     for p_batch in test_loader:
         p_batch_var = Variable(p_batch).cuda()
         p_batch_emb = modelD.encode(p_batch_var.detach(),filter_set)
@@ -170,11 +200,11 @@ def train_gender(args,modelD,train_dataset,test_dataset,\
     train_data_itr = enumerate(train_loader)
     criterion = nn.BCELoss()
 
-    for epoch in range(1,args.num_classifier_epochs):
+    for epoch in range(1,args.num_classifier_epochs + 1):
         correct = 0
         if epoch % 10 == 0:
             test_gender(args,test_dataset,modelD,net,experiment,epoch,filter_set)
-
+        embs_list, labels_list = [], []
         for p_batch in train_loader:
             p_batch_var = Variable(p_batch).cuda()
             p_batch_emb = modelD.encode(p_batch_var.detach(),filter_set)
@@ -190,11 +220,23 @@ def train_gender(args,modelD,train_dataset,test_dataset,\
                     y_hat.data.cpu().numpy(),average="micro")
             f1 = f1_score(y.data.cpu().numpy(), preds.data.cpu().numpy(),\
                     average='binary')
+            if epoch == args.num_classifier_epochs:
+                embs_list.append(p_batch_emb)
+                labels_list.append(y)
             print("Train Gender Loss is %f Accuracy is: %f AUC: %f F1:%f"\
                     %(loss,acc,AUC,f1))
             if args.do_log:
                 experiment.log_metric("Train "+ net.attribute+"\
                          AUC",float(AUC),step=epoch)
+
+    cat_labels_list = torch.cat(labels_list,0).data.cpu().numpy()
+    cat_embs_list = torch.cat(embs_list,0).data.cpu().numpy()
+    ''' Dummy Classifier '''
+    for strategy in ['stratified', 'most_frequent', 'uniform']:
+        dummy = DummyClassifier(strategy=strategy)
+        dummy.fit(cat_embs_list, cat_labels_list)
+        test_dummy(args,test_dataset,modelD,net,dummy,experiment,\
+                epoch,strategy,False,filter_set)
 
 def test_age(args,test_dataset,modelD,net,experiment,\
         epoch,filter_set=None):
@@ -232,11 +274,11 @@ def train_age(args,modelD,train_dataset,test_dataset,attr_data,\
     train_data_itr = enumerate(train_loader)
     criterion = nn.NLLLoss()
 
-    for epoch in range(1,args.num_classifier_epochs):
+    for epoch in range(1,args.num_classifier_epochs+1):
         correct = 0
         if epoch % 10 == 0:
             test_age(args,test_dataset,modelD,net,experiment,epoch,filter_set)
-
+        embs_list, labels_list = [], []
         for p_batch in train_loader:
             p_batch_var = Variable(p_batch).cuda()
             p_batch_emb = modelD.encode(p_batch_var.detach(),filter_set)
@@ -250,10 +292,22 @@ def train_age(args,modelD,train_dataset,test_dataset,attr_data,\
             acc = 100. * correct / len(p_batch)
             AUC = multiclass_roc_auc_score(y.data.cpu().numpy(),y_hat.data.cpu().numpy())
             f1 = f1_score(y.data.cpu().numpy(), preds.data.cpu().numpy(), average='micro')
+            if epoch == args.num_classifier_epochs:
+                embs_list.append(p_batch_emb)
+                labels_list.append(y)
             print("Train Age Loss is %f Accuracy is: %f AUC: %f F1: %f" \
                     %(loss,acc,AUC,f1))
             if args.do_log:
                 experiment.log_metric("Train"+net.attribute+"AUC",float(AUC),step=epoch)
+
+    cat_labels_list = torch.cat(labels_list,0).data.cpu().numpy()
+    cat_embs_list = torch.cat(embs_list,0).data.cpu().numpy()
+    ''' Dummy Classifier '''
+    for strategy in ['stratified', 'most_frequent', 'uniform']:
+        dummy = DummyClassifier(strategy=strategy)
+        dummy.fit(cat_embs_list, cat_labels_list)
+        test_dummy(args,test_dataset,modelD,net,dummy,experiment,\
+                epoch,strategy,True,filter_set)
 
 def test_occupation(args,test_dataset,modelD,net,experiment,epoch,filter_set=None):
     test_loader = DataLoader(test_dataset, num_workers=1, batch_size=8000)
@@ -298,11 +352,11 @@ def train_occupation(args,modelD,train_dataset,test_dataset,\
     train_data_itr = enumerate(train_loader)
     criterion = nn.NLLLoss()
 
-    for epoch in range(1,args.num_classifier_epochs):
+    for epoch in range(1,args.num_classifier_epochs+1):
         correct = 0
         if epoch % 10 == 0:
             test_occupation(args,test_dataset,modelD,net,experiment,epoch,filter_set)
-
+        embs_list, labels_list = [], []
         for p_batch in train_loader:
             p_batch_var = Variable(p_batch).cuda()
             p_batch_emb = modelD.encode(p_batch_var.detach(),filter_set)
@@ -316,10 +370,22 @@ def train_occupation(args,modelD,train_dataset,test_dataset,\
             acc = 100. * correct / len(p_batch)
             AUC = multiclass_roc_auc_score(y.data.cpu().numpy(),y_hat.data.cpu().numpy())
             f1 = f1_score(y.data.cpu().numpy(), preds.data.cpu().numpy(), average='micro')
+            if epoch == args.num_classifier_epochs:
+                embs_list.append(p_batch_emb)
+                labels_list.append(y)
             print("Train Occupation Loss is %f Accuracy is: %f AUC: %f F1: %f"\
                     %(loss,acc,AUC,f1))
             if args.do_log:
                 experiment.log_metric("Train"+ net.attribute+"AUC",float(AUC),step=epoch)
+
+    cat_labels_list = torch.cat(labels_list,0).data.cpu().numpy()
+    cat_embs_list = torch.cat(embs_list,0).data.cpu().numpy()
+    ''' Dummy Classifier '''
+    for strategy in ['stratified', 'most_frequent', 'uniform']:
+        dummy = DummyClassifier(strategy=strategy)
+        dummy.fit(cat_embs_list, cat_labels_list)
+        test_dummy(args,test_dataset,modelD,net,dummy,experiment,\
+                epoch,strategy,True,filter_set)
 
 def collate_fn(batch):
     if isinstance(batch, np.ndarray) or (isinstance(batch, list) and isinstance(batch[0], np.ndarray)):

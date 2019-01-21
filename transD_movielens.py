@@ -461,48 +461,29 @@ def train_gcmc(data_loader,counter,args,train_hash,modelD,optimizerD,\
             optimizerD.step()
 
         if constant != 0:
-            correct = 0
             gender_correct,occupation_correct,age_correct,random_correct = 0,0,0,0
-            precision_list = []
-            recall_list = []
-            fscore_list = []
             correct = 0
             for fairD_disc in masked_fairD_set:
                 if fairD_disc is not None:
                     ''' No Gradients Past Here '''
                     with torch.no_grad():
-                        task_loss,preds,lhs_emb,rhs_emb = modelD(p_batch_var,return_embeds=True)
+                        task_loss,preds,lhs_emb,rhs_emb = modelD(p_batch_var,\
+                                return_embeds=True,filters=masked_filter_set)
                         p_lhs_emb = lhs_emb[:len(p_batch)]
-
-                        ''' Apply Filter or Not to Embeddings '''
-                        if args.sample_mask or args.use_trained_filters:
-                            filter_emb = 0
-                            for filter_ in masked_filter_set:
-                                if filter_ is not None:
-                                    filter_emb += filter_(p_lhs_emb)
-                        else:
-                            filter_emb = p_lhs_emb
+                        filter_emb = p_lhs_emb
                         probs, l_A_labels, l_preds = fairD_disc.predict(filter_emb,p_batch[:,0],True)
                         l_correct = l_preds.eq(l_A_labels.view_as(l_preds)).sum().item()
                         if fairD_disc.attribute == 'gender':
                             fairD_gender_loss = fairD_loss.detach().cpu().numpy()
-                            # l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
-                                    # average='binary')
                             gender_correct += l_correct #
                         elif fairD_disc.attribute == 'occupation':
                             fairD_occupation_loss = fairD_loss.detach().cpu().numpy()
-                            # l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
-                                    # average='micro')
                             occupation_correct += l_correct
                         elif fairD_disc.attribute == 'age':
                             fairD_age_loss = fairD_loss.detach().cpu().numpy()
-                            # l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
-                                    # average='micro')
                             age_correct += l_correct
                         else:
                             fairD_random_loss = fairD_loss.detach().cpu().numpy()
-                            # l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
-                                    # average='micro')
                             random_correct += l_correct
 
     ''' Logging for end of epoch '''

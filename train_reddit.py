@@ -10,6 +10,7 @@ from torch.nn.init import xavier_normal, xavier_uniform
 from torch.distributions import Categorical
 from sklearn.metrics import precision_recall_fscore_support
 from sklearn.metrics import roc_auc_score, accuracy_score
+from sklearn.metrics import f1_score
 import numpy as np
 import random
 import argparse
@@ -41,12 +42,12 @@ class MarginRankingLoss(nn.Module):
             scores = scores * weights / weights.mean()
         return scores.mean(), scores
 
-_cb_var_user = []
-_cb_var_sr = []
 def corrupt_reddit_batch(batch, num_users, num_sr):
     # batch: ltensor type, contains positive triplets
     batch_size, _ = batch.size()
     corrupted = batch.clone()
+    _cb_var_user = []
+    _cb_var_sr = []
 
     if len(_cb_var_user) == 0 and len(_cb_var_sr) == 0:
         _cb_var_user.append(torch.LongTensor(batch_size//2).cuda())
@@ -60,18 +61,22 @@ def corrupt_reddit_batch(batch, num_users, num_sr):
 
     return corrupted.contiguous()
 
-def train_reddit_nce(data_loader,counter,args,modelD,optimizerD,\
-        fairD_set, optimizer_fairD_set, filter_set, experiment):
+def mask_fairDiscriminators(discriminators, mask):
+    # compress('ABCDEF', [1,0,1,0,1,1]) --> A C E F
+    return (d for d, s in zip(discriminators, mask) if s)
+
+def train_reddit_nce(data_loader,train_hash,counter,args,modelD,optimizerD,\
+        fairD_set, optimizer_fairD_set, filter_set, masks, experiment):
     lossesD = []
-    monitor_grads = []
     total_ent = 0
     loss_func = MarginRankingLoss(args.margin,args.num_nce)
     data_itr = tqdm(enumerate(data_loader))
-
+    correct_array = np.zeros(len(fairD_set))
     for idx, p_batch in data_itr:
         ''' Sample Fairness Discriminators '''
         if args.sample_mask:
-            mask = np.random.choice([0, 1], size=(args.num_sensitive,))
+            mask = random.choice(masks)
+            # mask = np.random.choice([0, 1], size=(args.num_sensitive,))
             masked_fairD_set = list(mask_fairDiscriminators(fairD_set,mask))
             masked_optimizer_fairD_set = list(mask_fairDiscriminators(optimizer_fairD_set,mask))
             masked_filter_set = list(mask_fairDiscriminators(filter_set,mask))
@@ -83,10 +88,16 @@ def train_reddit_nce(data_loader,counter,args,modelD,optimizerD,\
 
         nce_list = []
         for i in range(0,args.num_nce):
-            nce_list.append(corrupt_reddit_batch(p_batch,args.num_users,args.num_sr))
+            nce_batch = corrupt_reddit_batch(p_batch,args.num_users,args.num_sr)
+            if args.filter_false_negs:
+                nce_falseNs = torch.FloatTensor(np.array([int(x.tobytes() in train_hash)\
+                        for x in nce_batch.numpy()], dtype=np.float32))
+                nce_falseNs = Variable(nce_falseNs).to(args.device)
+            else:
+                nce_falseNs = None
+            nce_list.append(nce_batch)
 
         nce_batch = torch.cat(nce_list)
-
         p_batch_var = Variable(p_batch).cuda()
         nce_batch = Variable(nce_batch).cuda()
 
@@ -96,46 +107,46 @@ def train_reddit_nce(data_loader,counter,args,modelD,optimizerD,\
 
         ''' Update Encoder '''
         if constant != 0:
-            d_outs,user_emb,sr_emb  = modelD(d_ins,True)
-            p_lhs_emb = lhs_emb[:len(p_batch_var)]
+            d_outs,lhs_emb,rhs_emb = modelD(d_ins,True,filters=masked_filter_set)
+            filter_l_emb = lhs_emb[:len(p_batch_var)]
             p_rhs_emb = rhs_emb[:len(p_batch_var)]
             nce_lhs_emb = lhs_emb[len(p_batch_var):(len(p_batch_var)+len(nce_batch))]
             nce_rhs_emb = rhs_emb[len(p_batch_var):(len(p_batch_var)+len(nce_batch))]
             l_penalty = 0
 
-            ''' Apply Filter or Not to Embeddings '''
-            p_enrgs,nce_enrgs,filter_l_emb = apply_filters_nce(args,p_lhs_emb,p_rhs_emb,nce_lhs_emb,\
-                    nce_rhs_emb,rel_emb,p_batch_var,nce_batch,d_outs)
-
             ''' Apply Discriminators '''
             for fairD_disc, fair_optim in zip(masked_fairD_set,masked_optimizer_fairD_set):
                 if fairD_disc is not None and fair_optim is not None:
-                    l_penalty += fairD_disc(filter_l_emb,p_batch[:,0])
+                    l_penalty += fairD_disc(filter_l_emb,p_batch[:,0],True)
 
             if not args.use_cross_entropy:
                 fair_penalty = constant - l_penalty
             else:
                 fair_penalty = -1*l_penalty
 
-            if not args.freeze_transD:
+            if not args.freeze_encoder:
                 optimizerD.zero_grad()
+                p_enrgs = d_outs[:len(p_batch_var)]
+                nce_enrgs = d_outs[len(p_batch_var):(len(p_batch_var)+len(nce_batch))]
                 nce_term, nce_term_scores = loss_func(p_enrgs, nce_enrgs)
                 lossD = nce_term + args.gamma*fair_penalty
                 lossD.backward(retain_graph=False)
                 optimizerD.step()
 
-            l_penalty_2 = 0
-            for fairD_disc, fair_optim in zip(masked_fairD_set,\
-                    masked_optimizer_fairD_set):
-                if fairD_disc is not None and fair_optim is not None:
-                    fair_optim.zero_grad()
-                    l_penalty_2 += fairD_disc(filter_l_emb.detach(),p_batch[:,0])
-                    if not args.use_cross_entropy:
-                        fairD_loss = -1*(1 - l_penalty_2)
-                    else:
-                        fairD_loss = l_penalty_2
-                    fairD_loss.backward(retain_graph=False)
-                    fair_optim.step()
+            for k in range(0,args.D_steps):
+                l_penalty_2 = 0
+                for fairD_disc, fair_optim in zip(masked_fairD_set,\
+                        masked_optimizer_fairD_set):
+                    if fairD_disc is not None and fair_optim is not None:
+                        fair_optim.zero_grad()
+                        l_penalty_2 += fairD_disc(filter_l_emb.detach(),\
+                                p_batch[:,0],True)
+                        if not args.use_cross_entropy:
+                            fairD_loss = -1*(1 - l_penalty_2)
+                        else:
+                            fairD_loss = l_penalty_2
+                        fairD_loss.backward(retain_graph=True)
+                        fair_optim.step()
         else:
             d_outs = modelD(d_ins)
             fair_penalty = Variable(torch.zeros(1)).cuda()
@@ -148,35 +159,29 @@ def train_reddit_nce(data_loader,counter,args,modelD,optimizerD,\
             optimizerD.step()
 
         if constant != 0:
-            correct = 0
-            gender_correct,occupation_correct,age_correct,random_correct = 0,0,0,0
-            precision_list = []
-            recall_list = []
-            fscore_list = []
-            correct = 0
-            for fairD_disc, fair_optim in zip(masked_fairD_set,masked_optimizer_fairD_set):
-                if fairD_disc is not None and fair_optim is not None:
-                    fair_optim.zero_grad()
+            for fairD_disc in masked_fairD_set:
+                if fairD_disc is not None:
                     ''' No Gradients Past Here '''
                     with torch.no_grad():
-                        d_outs,lhs_emb,rhs_emb,rel_emb = modelD(d_ins,True)
-                        p_lhs_emb = lhs_emb[:len(p_batch)]
-
-                        ''' Apply Filter or Not to Embeddings '''
-                        if args.sample_mask or args.use_trained_filters:
-                            filter_emb = 0
-                            for filter_ in masked_filter_set:
-                                if filter_ is not None:
-                                    filter_emb += filter_(p_lhs_emb)
-                        else:
-                            filter_emb = p_lhs_emb
+                        d_outs,lhs_emb,rhs_emb = modelD(d_ins,True,\
+                                filters=masked_filter_set)
+                        filter_l_emb = lhs_emb[:len(p_batch)]
+                        probs, l_A_labels, l_preds = fairD_disc.predict(filter_l_emb,p_batch[:,0],True)
+                        l_correct = l_preds.eq(l_A_labels.view_as(l_preds)).sum().item()
+                        fairD_disc.num_correct += l_correct
 
     ''' Logging for end of epoch '''
     if args.do_log:
         if not args.freeze_encoder:
             experiment.log_metric("NCE Loss",float(lossD),step=counter)
+            for fairD_disc in fairD_set:
+                if fairD_disc is not None:
+                    acc = 100. * fairD_disc.num_correct / len(data_loader.dataset)
+                    fairD_disc.num_correct = 0
+                    experiment.log_metric("Train "+fairD_disc.attribute +\
+                            " Disc",float(acc),step=counter)
 
-def train_fair_reddit(data_loader, counter, args, modelD, optimizerD,\
-         fairD_set, optimizer_fairD_set, filter_set, experiment):
-    train_reddit_nce(data_loader,counter,args,modelD,optimizerD,\
-            fairD_set,optimizer_fairD_set,filter_set,experiment)
+def train_fair_reddit(data_loader,train_hash,counter,args,modelD,optimizerD,\
+         fairD_set, optimizer_fairD_set, filter_set, masks, experiment):
+    train_reddit_nce(data_loader,train_hash,counter,args,modelD,optimizerD,\
+            fairD_set,optimizer_fairD_set,filter_set,masks,experiment)

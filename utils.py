@@ -10,9 +10,20 @@ class RedditDataset(Dataset):
         self.u_to_idx = u_to_idx
         self.sr_to_idx = sr_to_idx
         self.prefetch_to_gpu = prefetch_to_gpu
+        self.edges = edges
 
     def __len__(self):
         return len(self.dataset)
+
+    def get_mapping(self,edge):
+        if edge[0].split('_')[0] == 'U':
+            user = torch.LongTensor([self.u_to_idx[edge[0]]])
+            sr = torch.LongTensor([self.sr_to_idx[edge[1]]])
+        else:
+            user = torch.LongTensor([self.u_to_idx[edge[1]]])
+            sr = torch.LongTensor([self.sr_to_idx[edge[0]]])
+        datum = torch.cat((user,sr),0)
+        return datum
 
     def __getitem__(self, idx):
         ''' Always return [User, SR] '''
@@ -69,7 +80,6 @@ class NodeClassification(Dataset):
             self.dataset = self.dataset.cpu()
 
         data = self.dataset
-        # np.random.shuffle(data)
         data = np.ascontiguousarray(data)
         self.dataset = ltensor(data)
 
