@@ -845,6 +845,7 @@ def main(args):
 
                 joblib.dump({'l_ranks':l_ranks,'r_ranks':r_ranks},args.outname_base+\
                             'epoch{}_validation_ranks.pkl'.format(epoch), compress=9)
+                print("Mean rank %f" %(float(avg_mr)))
                 if args.do_log: # Tensorboard logging
                     tflogger.scalar_summary('Mean Rank',float(avg_mr),epoch)
                     tflogger.scalar_summary('Mean Reciprocal Rank',float(avg_mrr),epoch)
