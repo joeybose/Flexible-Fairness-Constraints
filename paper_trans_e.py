@@ -169,7 +169,7 @@ class DemParDisc(nn.Module):
         h2 = F.leaky_relu(self.W2(h1))
         h3 = F.leaky_relu(self.W3(h2))
         scores = self.W4(h3)
-        A_labels = Variable(torch.Tensor(self.attr_mat[ents][:,self.a_idx])).cuda()
+        A_labels = Variable(torch.Tensor(self.attr_mat[ents.cpu()][:,self.a_idx])).cuda()
         if self.cross_entropy:
             fair_penalty = F.binary_cross_entropy_with_logits(scores,\
                     A_labels,weight=self.weights)
@@ -183,7 +183,7 @@ class DemParDisc(nn.Module):
         h2 = F.leaky_relu(self.W2(h1))
         h3 = F.leaky_relu(self.W3(h2))
         scores = self.W4(h3)
-        A_labels = Variable(torch.Tensor(self.attr_mat[ents][:,self.a_idx])).cuda()
+        A_labels = Variable(torch.Tensor(self.attr_mat[ents.cpu()][:,self.a_idx])).cuda()
         # if self.cross_entropy:
             # probs = F.binary_cross_entropy_with_logits(scores,A_labels,reduction='none')
             # preds = (probs > torch.Tensor([0.5]).cuda()).float() * 1
@@ -299,7 +299,7 @@ def parse_args():
     parser.add_argument('--remove_old_run', action='store_true', help="remove old run")
     parser.add_argument('--data_dir', type=str, default='./data/', help="Contains Pickle files")
     parser.add_argument('--num_epochs', type=int, default=1000, help='Number of training epochs (default: 500)')
-    parser.add_argument('--batch_size', type=int, default=4096, help='Batch size (default: 512)')
+    parser.add_argument('--batch_size', type=int, default=16000, help='Batch size (default: 512)')
     parser.add_argument('--valid_freq', type=int, default=20, help='Validate frequency in epochs (default: 50)')
     parser.add_argument('--print_freq', type=int, default=5, help='Print frequency in epochs (default: 5)')
     parser.add_argument('--embed_dim', type=int, default=50, help='Embedding dimension (default: 50)')
@@ -437,6 +437,7 @@ def main(args):
         test_set = KBDataset(args.data_path % 'test')
         print('50 Most Commone Attributes')
 
+    ipdb.set_trace()
     if args.prefetch_to_gpu:
         train_hash = set([r.tobytes() for r in train_set.dataset.cpu().numpy()])
     else:
@@ -570,9 +571,9 @@ def main(args):
                 r_correct = r_preds.eq(r_A_labels.view_as(r_preds)).sum().item()
                 correct += l_correct + r_correct
                 total_ent += 2*len(p_batch)
-                l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
+                l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels.cpu(), l_preds.cpu(),\
                         average='binary')
-                r_precision,r_recall,r_fscore,_ = precision_recall_fscore_support(r_A_labels, r_preds,\
+                r_precision,r_recall,r_fscore,_ = precision_recall_fscore_support(r_A_labels.cpu(), r_preds.cpu(),\
                         average='binary')
                 precision = (l_precision + r_precision) / 2
                 recall = (l_recall + r_recall) / 2
@@ -631,9 +632,9 @@ def main(args):
             r_preds, r_A_labels = fairD.predict(rhs_emb,rhs,return_preds=True)
             l_correct = l_preds.eq(l_A_labels.view_as(l_preds)).sum().item()
             r_correct = r_preds.eq(r_A_labels.view_as(r_preds)).sum().item()
-            l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels, l_preds,\
+            l_precision,l_recall,l_fscore,_ = precision_recall_fscore_support(l_A_labels.cpu(), l_preds.cpu(),\
                     average='binary')
-            r_precision,r_recall,r_fscore,_ = precision_recall_fscore_support(r_A_labels, r_preds,\
+            r_precision,r_recall,r_fscore,_ = precision_recall_fscore_support(r_A_labels.cpu(), r_preds.cpu(),\
                     average='binary')
             precision = (l_precision + r_precision) / 2
             recall = (l_recall + r_recall) / 2
@@ -746,6 +747,7 @@ def main(args):
             test_fairness(valid_set)
 
             joblib.dump({'l_ranks':l_ranks, 'r_ranks':r_ranks}, args.outname_base+'epoch{}_validation_ranks.pkl'.format(epoch), compress=9)
+            print("Mean Rank is %f" %(float(avg_mr)))
             if args.do_log: # Tensorboard logging
                 tflogger.scalar_summary('Mean Rank',float(avg_mr),epoch)
                 tflogger.scalar_summary('Mean Reciprocal Rank',float(avg_mrr),epoch)

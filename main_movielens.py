@@ -175,15 +175,6 @@ def main(args):
             gender_filter = AttributeFilter(args.embed_dim,attribute='gender').to(args.device)
             occupation_filter = AttributeFilter(args.embed_dim,attribute='occupation').to(args.device)
             age_filter = AttributeFilter(args.embed_dim,attribute='age').to(args.device)
-            # if not args.use_trained_filters:
-                # ''' Optimize the Filters oth. it's Pretrained '''
-                # optimizer_fairD_gender = optimizer(list(fairD_gender.parameters()) + \
-                        # list(gender_filter.parameters()),'adam', args.lr)
-                # optimizer_fairD_occupation = optimizer(list(fairD_occupation.parameters()) + \
-                        # list(occupation_filter.parameters()),'adam',args.lr)
-                # optimizer_fairD_age = optimizer(list(fairD_age.parameters()) + \
-                        # list(age_filter.parameters()),'adam', args.lr)
-        # else:
             optimizer_fairD_gender = optimizer(fairD_gender.parameters(),'adam', args.lr)
             optimizer_fairD_occupation = optimizer(fairD_occupation.parameters(),'adam',args.lr)
             optimizer_fairD_age = optimizer(fairD_age.parameters(),'adam', args.lr)

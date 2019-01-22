@@ -44,6 +44,14 @@ def apply_filters_gcmc(p_lhs_emb,masked_filter_set):
             filter_l_emb += filter_(p_lhs_emb)
     return filter_l_emb
 
+def apply_filters_single_node(p_lhs_emb,masked_filter_set):
+    ''' Doesnt Have Masked Filters yet '''
+    filter_l_emb, filter_r_emb = 0,0
+    for filter_ in masked_filter_set:
+        if filter_ is not None:
+            filter_l_emb += filter_(p_lhs_emb)
+    return filter_l_emb
+
 def apply_filters_reddit(p_lhs_emb,masked_filter_set):
     ''' Doesnt Have Masked Filters yet '''
     filter_l_emb = 0
@@ -51,6 +59,16 @@ def apply_filters_reddit(p_lhs_emb,masked_filter_set):
         if filter_ is not None:
             filter_l_emb += filter_(p_lhs_emb)
     return filter_l_emb
+
+def apply_filters_transd(p_lhs_emb,p_rhs_emb,masked_filter_set):
+    ''' Doesnt Have Masked Filters yet '''
+    filter_l_emb = 0
+    filter_r_emb = 0
+    for filter_ in masked_filter_set:
+        if filter_ is not None:
+            filter_l_emb += filter_(p_lhs_emb)
+            filter_r_emb += filter_(p_rhs_emb)
+    return filter_l_emb,filter_r_emb
 
 class RedditEncoder(nn.Module):
     def __init__(self, num_users, num_sr, embed_dim, p):
@@ -281,7 +299,7 @@ class TransD(nn.Module):
         proj_es = self.transfer(es, ts, rel_ts)
         return proj_es
 
-    def forward(self, triplets, return_ent_emb=False):
+    def forward(self, triplets, return_ent_emb=False, filters=None):
         lhs_idxs = triplets[:, 0]
         rel_idxs = triplets[:, 1]
         rhs_idxs = triplets[:, 2]
@@ -290,16 +308,25 @@ class TransD(nn.Module):
 
         lhs = self.ent_embeds(lhs_idxs, rel_idxs)
         rhs = self.ent_embeds(rhs_idxs, rel_idxs)
+        if filters is not None:
+            constant = len(filters) - filters.count(None)
+            if constant !=0:
+                lhs,rhs = apply_filters_transd(lhs,rhs,filters)
 
         if not return_ent_emb:
             enrgs = (lhs + rel_es - rhs).norm(p=self.p, dim=1)
             return enrgs
         else:
             enrgs = (lhs + rel_es - rhs).norm(p=self.p, dim=1)
-            return enrgs,lhs,rhs,rel_es
+            return enrgs,lhs,rhs
 
-    def get_embed(self, ents, rel_idxs):
-        ent_embed = self.ent_embeds(ents, rel_idxs)
+    def get_embed(self, ents, rel_idxs, filters=None):
+        with torch.no_grad():
+            ent_embed = self.ent_embeds(ents, rel_idxs)
+            if filters is not None:
+                constant = len(filters) - filters.count(None)
+                if constant !=0:
+                    ents_embed = apply_filters_single_node(ents_embed,filters)
         return ent_embed
 
     def save(self, fn):
@@ -1043,6 +1070,8 @@ class FBDemParDisc(nn.Module):
         self.W2 = nn.Linear(int(self.embed_dim * 2), int(self.embed_dim), bias=True)
         self.W3 = nn.Linear(int(self.embed_dim), int(self.embed_dim / 2), bias=True)
         self.W4 = nn.Linear(int(self.embed_dim / 2), self.out_dim, bias=True)
+        self.sigmoid = nn.Sigmoid()
+        self.criterion = nn.BCELoss()
 
         if attribute_data is not None:
             self.attr_mat = np.array(pickle.load(open(attribute_data[0],'rb')))
@@ -1063,34 +1092,43 @@ class FBDemParDisc(nn.Module):
             self.sensitive_weight = 1-float(self.most_common[self.a_idx][1]) / sum(self.attr_count.values())
             self.weights = torch.Tensor((1-self.sensitive_weight,self.sensitive_weight)).cuda()
 
-    def forward(self, ents_emb, ents, force_ce=False):
+    def forward(self, ents_emb, ents, return_loss=False):
         h1 = F.leaky_relu(self.W1(ents_emb))
         h2 = F.leaky_relu(self.W2(h1))
         h3 = F.leaky_relu(self.W3(h2))
         scores = self.W4(h3)
+        output = self.sigmoid(scores)
         A_labels = Variable(torch.Tensor(self.attr_mat[ents][:,self.a_idx])).cuda()
-        A_labels = A_labels.unsqueeze(1)
-        if self.cross_entropy or force_ce:
-            fair_penalty = F.binary_cross_entropy_with_logits(scores,\
-                    A_labels)#,weight=self.weights)
+        # A_labels = A_labels.unsqueeze(1)
+        if return_loss:
+            loss = self.criterion(output.squeeze(), A_labels)
+            return loss
         else:
-            probs = torch.sigmoid(scores)
-            fair_penalty = F.l1_loss(probs,A_labels,\
-                    reduction='elementwise_mean')
-        return fair_penalty
+            return output.squeeze(),A_labels
+        # if self.cross_entropy or force_ce:
+            # # fair_penalty = F.binary_cross_entropy_with_logits(scores,\
+                    # # A_labels)#,weight=self.weights)
+            # loss = self.criterion(output.squeeze(), A_labels)
+            # return loss
+        # else:
+            # probs = torch.sigmoid(scores)
+            # fair_penalty = F.l1_loss(probs,A_labels,\
+                    # reduction='elementwise_mean')
+        # return fair_penalty
 
     def predict(self, ents_emb, ents, return_preds=False):
-        h1 = F.leaky_relu(self.W1(ents_emb))
-        h2 = F.leaky_relu(self.W2(h1))
-        h3 = F.leaky_relu(self.W3(h2))
-        scores = self.W4(h3)
-        A_labels = Variable(torch.Tensor(self.attr_mat[ents][:,self.a_idx])).cuda()
-        A_labels = A_labels.unsqueeze(1)
-        probs = torch.sigmoid(scores)
-        preds = (probs > torch.Tensor([0.5]).cuda()).float() * 1
+        with torch.no_grad():
+            h1 = F.leaky_relu(self.W1(ents_emb))
+            h2 = F.leaky_relu(self.W2(h1))
+            h3 = F.leaky_relu(self.W3(h2))
+            scores = self.W4(h3)
+            output = self.sigmoid(scores)
+            A_labels = Variable(torch.Tensor(self.attr_mat[ents][:,self.a_idx])).cuda()
+            # A_labels = A_labels.unsqueeze(1)
+            preds = (output > torch.Tensor([0.5]).cuda()).float() * 1
         correct = preds.eq(A_labels.view_as(preds)).sum().item()
         if return_preds:
-            return preds, A_labels
+            return preds, A_labels, output.squeeze()
         else:
             return correct
 

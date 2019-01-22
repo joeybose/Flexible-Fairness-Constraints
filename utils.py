@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
+import pickle
 from collections import defaultdict
 import ipdb
 
@@ -60,6 +61,31 @@ class KBDataset(Dataset):
         np.random.shuffle(data)
         data = np.ascontiguousarray(data)
         self.dataset = ltensor(data)
+
+        if self.prefetch_to_gpu:
+            self.dataset = self.dataset.cuda().contiguous()
+
+class FBDataset(Dataset):
+    def __init__(self, path, prefetch_to_gpu=False):
+        self.prefetch_to_gpu = prefetch_to_gpu
+        self.dataset = np.ascontiguousarray(np.array(pickle.load(open(path, 'rb'))))
+        if prefetch_to_gpu:
+            self.dataset = torch.LongTensor(self.dataset).cuda()
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        return self.dataset[idx]
+
+    def shuffle(self):
+        if self.dataset.is_cuda:
+            self.dataset = self.dataset.cpu()
+
+        data = self.dataset.numpy()
+        np.random.shuffle(data)
+        data = np.ascontiguousarray(data)
+        self.dataset = torch.LongTensor(data)
 
         if self.prefetch_to_gpu:
             self.dataset = self.dataset.cuda().contiguous()
