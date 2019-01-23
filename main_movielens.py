@@ -329,7 +329,7 @@ def main(args):
             age_filter.save(args.outname_base+'AgeFilter.pts')
 
     constant = len(fairD_set) - fairD_set.count(None)
-    if constant != 0 or args.test_new_disc:
+    if args.test_new_disc:
         if args.test_new_disc:
             args.use_attr = True
         ''' Training Fresh Discriminators'''

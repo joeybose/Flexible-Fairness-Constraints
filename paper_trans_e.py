@@ -10,6 +10,8 @@ from torch.nn.init import xavier_normal, xavier_uniform
 from torch.distributions import Categorical
 from tensorboard_logger import Logger as tfLogger
 from sklearn.metrics import precision_recall_fscore_support
+from sklearn.metrics import roc_auc_score, accuracy_score
+from sklearn.metrics import f1_score
 import numpy as np
 import random
 import argparse
@@ -18,9 +20,9 @@ import json
 import logging
 import sys, os
 import subprocess
-from model import FBDemParDisc
+from model import FBDemParDisc,AttributeFilter
 from tqdm import tqdm
-from utils import create_or_append, compute_rank
+from utils import create_or_append, compute_rank, NodeClassification
 import joblib
 from collections import Counter
 import ipdb
@@ -34,6 +36,28 @@ ltensor = torch.LongTensor
 v2np = lambda v: v.data.cpu().numpy()
 
 USE_SPARSE_EMB = False
+
+def apply_filters_single_node(p_lhs_emb,masked_filter_set):
+    ''' Doesnt Have Masked Filters yet '''
+    filter_l_emb, filter_r_emb = 0,0
+    for filter_ in masked_filter_set:
+        if filter_ is not None:
+            filter_l_emb += filter_(p_lhs_emb)
+    return filter_l_emb
+
+def apply_filters_transd(p_lhs_emb,p_rhs_emb,masked_filter_set):
+    ''' Doesnt Have Masked Filters yet '''
+    filter_l_emb = 0
+    filter_r_emb = 0
+    for filter_ in masked_filter_set:
+        if filter_ is not None:
+            filter_l_emb += filter_(p_lhs_emb)
+            filter_r_emb += filter_(p_rhs_emb)
+    return filter_l_emb,filter_r_emb
+
+def mask_fairDiscriminators(discriminators, mask):
+    # compress('ABCDEF', [1,0,1,0,1,1]) --> A C E F
+    return (d for d, s in zip(discriminators, mask) if s)
 
 class TransE(nn.Module):
     def __init__(self, num_ent, num_rel, embed_dim, p):
@@ -127,7 +151,7 @@ class TransD(nn.Module):
             if filters is not None:
                 constant = len(filters) - filters.count(None)
                 if constant !=0:
-                    ents_embed = apply_filters_single_node(ents_embed,filters)
+                    ent_embed = apply_filters_single_node(ent_embed,filters)
         return ent_embed
 
     def save(self, fn):
@@ -359,14 +383,18 @@ def monitor_weight_norm(model):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--show_tqdm', type=int, default=0, help='')
+    parser.add_argument('--show_tqdm', type=int, default=1, help='')
+    parser.add_argument('--use_trained_filters', type=bool, default=False, help='Sample a binary mask for discriminators to use')
+    parser.add_argument('--test_new_disc', action='store_true', help="Load TransD")
     parser.add_argument('--sample_mask', type=bool, default=False, help='Sample a binary mask for discriminators to use')
     parser.add_argument('--dataset', type=str, default='FB15k', help='Knowledge base version (default: WN)')
+    parser.add_argument('--num_classifier_epochs', type=int, default=50, help='Number of training epochs (default: 500)')
     parser.add_argument('--save_dir', type=str, default='./results/', help="output path")
     parser.add_argument('--do_log', action='store_true', help="whether to log to csv")
     parser.add_argument('--load_transD', action='store_true', help="Load TransD")
     parser.add_argument('--freeze_transD', action='store_true', help="Load TransD")
     parser.add_argument('--use_cross_entropy', action='store_true', help="DemPar Discriminators Loss as CE")
+    parser.add_argument('--D_steps', type=int, default=5, help='Number of D steps')
     parser.add_argument('--remove_old_run', action='store_true', help="remove old run")
     parser.add_argument('--data_dir', type=str, default='./data/', help="Contains Pickle files")
     parser.add_argument('--num_epochs', type=int, default=1000, help='Number of training epochs (default: 500)')
@@ -409,28 +437,43 @@ def parse_args():
     else:
         raise Exception("Argument 'dataset' can only be 'WN' or 'FB15k'.")
 
-    if args.use_attr:
-        args.attr_mat = os.path.join(args.data_dir,\
-                'Attributes_FB15k-train.pkl')
-        args.ent_to_idx = os.path.join(args.data_dir,\
-                'Attributes_FB15k-ent_to_idx.json')
-        args.attr_to_idx = os.path.join(args.data_dir,\
-                'Attributes_FB15k-attr_to_idx.json')
-        args.reindex_attr_idx = os.path.join(args.data_dir,\
-                'Attributes_FB15k-reindex_attr_to_idx.json')
-        args.attr_count = os.path.join(args.data_dir,\
-                'Attributes_FB15k-attr_count.json')
-    else:
-        args.attr_mat = None
-        args.ent_to_idx = None
-        args.attr_to_idx = None
-        args.reindex_attr_idx = None
+    # if args.use_attr:
+        # args.attr_mat = os.path.join(args.data_dir,\
+                # 'Attributes_FB15k-train.pkl')
+        # args.ent_to_idx = os.path.join(args.data_dir,\
+                # 'Attributes_FB15k-ent_to_idx.json')
+        # args.attr_to_idx = os.path.join(args.data_dir,\
+                # 'Attributes_FB15k-attr_to_idx.json')
+        # args.reindex_attr_idx = os.path.join(args.data_dir,\
+                # 'Attributes_FB15k-reindex_attr_to_idx.json')
+        # args.attr_count = os.path.join(args.data_dir,\
+                # 'Attributes_FB15k-attr_count.json')
+    # else:
+        # args.attr_mat = None
+        # args.ent_to_idx = None
+        # args.attr_to_idx = None
+        # args.reindex_attr_idx = None
+    args.attr_mat = os.path.join(args.data_dir,\
+            'Attributes_FB15k-train.pkl')
+    args.ent_to_idx = os.path.join(args.data_dir,\
+            'Attributes_FB15k-ent_to_idx.json')
+    args.attr_to_idx = os.path.join(args.data_dir,\
+            'Attributes_FB15k-attr_to_idx.json')
+    args.reindex_attr_idx = os.path.join(args.data_dir,\
+            'Attributes_FB15k-reindex_attr_to_idx.json')
+    args.attr_count = os.path.join(args.data_dir,\
+            'Attributes_FB15k-attr_count.json')
+    args.fair_att_0 = 0
+    args.fair_att_1 = 1
+    args.fair_att_2 = 2
     args.saved_path = os.path.join(args.save_dir,'Updated_Paper_FB15kD_final.pts')
-    args.fair_att = np.random.choice(1,1) # Pick a random sensitive attribute
-    print("Sensitive attribute is %d" % (args.fair_att))
+    # args.fair_att = np.random.choice(1,1) # Pick a random sensitive attribute
     args.outname_base = os.path.join(args.save_dir,\
-            args.namestr+'_FairD_{}_{}'.format(str(args.fair_att),args.dataset))
+            args.namestr+'FB_results')
 
+    args.filter_0_saved_path = args.outname_base + 'Filter_0.pts'
+    args.filter_1_saved_path = args.outname_base + 'Filter_1.pts'
+    args.filter_2_saved_path = args.outname_base + 'Filter_2.pts'
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     np.random.seed(args.seed)
@@ -516,6 +559,11 @@ def main(args):
     else:
         train_hash = set([r.tobytes() for r in train_set.dataset])
 
+    cutoff_constant = 0.8
+    train_cutoff_row = int(np.round(args.num_ent*cutoff_constant))
+    args.cutoff_row = train_cutoff_row
+    all_ents = np.arange(args.num_ent)
+    np.random.shuffle(all_ents)
     all_hash = train_hash.copy()
     all_hash.update(set([r.tobytes() for r in valid_set.dataset]))
     all_hash.update(set([r.tobytes() for r in test_set.dataset]))
@@ -525,6 +573,8 @@ def main(args):
     if not os.path.exists(logdir):
         os.makedirs(logdir)
     tflogger = tfLogger(logdir)
+    train_fairness_set = NodeClassification(all_ents[:args.cutoff_row], args.prefetch_to_gpu)
+    test_fairness_set = NodeClassification(all_ents[args.cutoff_row:], args.prefetch_to_gpu)
     ''' Comet Logging '''
     experiment = Experiment(api_key="Ht9lkWvTm58fRo9ccgpabq5zV", disabled= not args.do_log
                         ,project_name="graph-invariance-icml", workspace="joeybose")
@@ -625,7 +675,7 @@ def main(args):
                 list(filter_1.parameters()) + \
                 list(filter_2.parameters()), 'adam', args.lr)
     else:
-        optimizerD = optimizer(modelD.parameters(), 'adam_hyp3', args.lr)
+        optimizerD = optimizer(modelD.parameters(), 'adam', args.lr)
     schedulerD = lr_scheduler(optimizerD, args.decay_lr, args.num_epochs)
 
     loss_func = MarginRankingLoss(args.margin)
@@ -639,8 +689,6 @@ def main(args):
     def train(data_loader, counter, args, train_hash, modelD, optimizerD,\
             tflogger, fairD_set, optimizer_fairD_set, filter_set, experiment):
 
-        lossesD = []
-        monitor_grads = []
         correct = 0
         total_ent = 0
         fairD_0_loss, fairD_1_loss, fairD_2_loss = 0,0,0
@@ -688,7 +736,7 @@ def main(args):
             constant = len(masked_fairD_set) - masked_fairD_set.count(None)
             if args.ace == 0:
                 d_ins = torch.cat([p_batch_var, nce_batch], dim=0).contiguous()
-                if constant != 0 and not args.freeze_transD:
+                if constant != 0:
                     optimizerD.zero_grad()
                     d_outs,lhs_emb,rhs_emb = modelD(d_ins,True,filters=masked_filter_set)
                     l_penalty,r_penalty = 0,0
@@ -701,12 +749,13 @@ def main(args):
                     for fairD_disc in masked_fairD_set:
                         if fairD_disc is not None:
                             l_penalty += fairD_disc(filter_l_emb,p_batch[:,0].cpu(),True)
-                            r_penalty += fairD_disc(filter_r_emb,p_batch[:,2].cpu(),True)
+                            # r_penalty += fairD_disc(filter_r_emb,p_batch[:,2].cpu(),True)
 
-                    if not args.use_cross_entropy:
-                        fair_penalty = constant - 0.5*(l_penalty + r_penalty)
-                    else:
-                        fair_penalty = l_penalty + r_penalty
+                    # if not args.use_cross_entropy:
+                        # fair_penalty = constant - 0.5*(l_penalty + r_penalty)
+                    # else:
+                    # fair_penalty = -1*(l_penalty + r_penalty)
+                    fair_penalty = -1*l_penalty
 
                     if not args.freeze_transD:
                         p_enrgs = d_outs[:len(p_batch_var)]
@@ -725,11 +774,31 @@ def main(args):
                                 fair_optim.zero_grad()
                                 l_penalty_2 = fairD_disc(filter_l_emb.detach(),\
                                         p_batch[:,0].cpu(),True)
-                                r_penalty_2 = fairD_disc(filter_r_emb.detach(),\
-                                        p_batch[:,2].cpu(),True)
-                                fairD_loss = l_penalty_2 + r_penalty_2
+                                # r_penalty_2 = fairD_disc(filter_r_emb.detach(),\
+                                        # p_batch[:,2].cpu(),True)
+                                fairD_loss = l_penalty_2 #+ r_penalty_2
                                 fairD_loss.backward(retain_graph=False)
                                 fair_optim.step()
+                # elif args.freeze_transD:
+                    # with torch.no_grad():
+                        # d_outs,lhs_emb,rhs_emb = modelD(d_ins,True,filters=masked_filter_set)
+                        # p_lhs_emb = lhs_emb[:len(p_batch_var)]
+                        # p_rhs_emb = rhs_emb[:len(p_batch_var)]
+                        # filter_l_emb = p_lhs_emb
+                        # filter_r_emb = p_rhs_emb
+                    # for fairD_disc, fair_optim in zip(masked_fairD_set,\
+                            # masked_optimizer_fairD_set):
+                        # l_penalty_2 = 0
+                        # r_penalty_2 = 0
+                        # if fairD_disc is not None and fair_optim is not None:
+                            # fair_optim.zero_grad()
+                            # l_penalty_2 = fairD_disc(filter_l_emb.detach(),\
+                                    # p_batch[:,0].cpu(),True)
+                            # r_penalty_2 = fairD_disc(filter_r_emb.detach(),\
+                                    # p_batch[:,2].cpu(),True)
+                            # fairD_loss = l_penalty_2 + r_penalty_2
+                            # fairD_loss.backward(retain_graph=False)
+                            # fair_optim.step()
                 else:
                     d_outs = modelD(d_ins)
                     fair_penalty = Variable(torch.zeros(1)).cuda()
@@ -747,33 +816,32 @@ def main(args):
                     if fairD_disc is not None:
                         with torch.no_grad():
                             d_outs,lhs_emb,rhs_emb = modelD(d_ins,True,filters=masked_filter_set)
-                            # d_outs,lhs_emb,rhs_emb = modelD(d_ins,True)
                             p_lhs_emb = lhs_emb[:len(p_batch)]
                             p_rhs_emb = rhs_emb[:len(p_batch)]
                             filter_l_emb = p_lhs_emb
                             filter_r_emb = p_rhs_emb
 
-                        l_preds, l_A_labels, l_probs = fairD_disc.predict(filter_l_emb,\
-                                p_batch[:,0].cpu(),return_preds=True)
-                        r_preds, r_A_labels, r_probs = fairD_disc.predict(filter_r_emb,\
-                                p_batch[:,2].cpu(),return_preds=True)
-                        l_correct = l_preds.eq(l_A_labels.view_as(l_preds)).sum().item()
-                        r_correct = r_preds.eq(r_A_labels.view_as(r_preds)).sum().item()
-                        correct += l_correct + r_correct
-                        total_ent += 2*len(p_batch)
-                        l_AUC = roc_auc_score(l_A_labels.cpu().numpy(),l_probs.cpu().numpy(),average="micro")
-                        r_AUC = roc_auc_score(r_A_labels.cpu().numpy(),r_probs.cpu().numpy(),average="micro")
-                        AUC = (l_AUC + r_AUC) / 2
-                        print("Train %s AUC: %f" %(fairD_disc.attribute,AUC))
+                            l_preds, l_A_labels, l_probs = fairD_disc.predict(filter_l_emb,\
+                                    p_batch[:,0].cpu(),return_preds=True)
+                            r_preds, r_A_labels, r_probs = fairD_disc.predict(filter_r_emb,\
+                                    p_batch[:,2].cpu(),return_preds=True)
+                            l_correct = l_preds.eq(l_A_labels.view_as(l_preds)).sum().item()
+                            r_correct = r_preds.eq(r_A_labels.view_as(r_preds)).sum().item()
+                            correct += l_correct + r_correct
+                            total_ent += 2*len(p_batch)
+                            l_AUC = roc_auc_score(l_A_labels.cpu().numpy(),l_probs.cpu().numpy(),average="micro")
+                            r_AUC = roc_auc_score(r_A_labels.cpu().numpy(),r_probs.cpu().numpy(),average="micro")
+                            AUC = (l_AUC + r_AUC) / 2
+                            print("Train %s AUC: %f" %(fairD_disc.attribute,AUC))
 
-                        if fairD_disc.attribute == '0':
-                            correct_0 += l_correct + r_correct
-                        elif fairD_disc.attribute == '1':
-                            correct_1 += l_correct + r_correct
-                        else:
-                            correct_2 += l_correct + r_correct
+                            if fairD_disc.attribute == '0':
+                                correct_0 += l_correct + r_correct
+                            elif fairD_disc.attribute == '1':
+                                correct_1 += l_correct + r_correct
+                            else:
+                                correct_2 += l_correct + r_correct
 
-                        total_ent += 2*len(p_batch)
+                            total_ent += 2*len(p_batch)
 
                     if args.do_log and fairD_disc is not None: # Tensorboard logging
                         acc_0 = 100. * correct_0 / total_ent
@@ -791,9 +859,111 @@ def main(args):
             if fairD_set[2] is not None:
                 experiment.log_metric("Train Fairness Disc 2",float(acc_2),step=counter)
 
+    def test_attr(args,test_dataset,modelD,net,experiment,\
+            epoch,attribute,filter_set=None):
+        test_loader = DataLoader(test_dataset, num_workers=1, batch_size=4096)
+        # test_data_itr = enumerate(test_loader)
+        correct = 0
+        l_probs_list, r_probs_list = [], []
+        l_labels_list, r_labels_list = [], []
+        total_ent = 0
+        for triplet in test_loader:
+            lhs, rel, rhs = triplet[:,0], triplet[:,1],triplet[:,2]
+            l_batch = Variable(lhs).cuda()
+            r_batch = Variable(rhs).cuda()
+            rel_batch = Variable(rel).cuda()
+            lhs_emb = modelD.get_embed(l_batch.detach(),rel_batch.detach(),filter_set)
+            rhs_emb = modelD.get_embed(r_batch.detach(),rel_batch.detach(),filter_set)
+            l_preds,l_A_labels,l_probs = net.predict(lhs_emb,lhs.cpu(),return_preds=True)
+            r_preds, r_A_labels,r_probs = net.predict(rhs_emb,rhs.cpu(),return_preds=True)
+            l_correct = l_preds.eq(l_A_labels.view_as(l_preds)).sum().item()
+            r_correct = r_preds.eq(r_A_labels.view_as(r_preds)).sum().item()
+            l_probs_list.append(l_probs)
+            r_probs_list.append(r_probs)
+            l_labels_list.append(l_A_labels)
+            r_labels_list.append(r_A_labels)
+            correct += l_correct #+ r_correct
+            total_ent += len(lhs_emb) #+ len(rhs_emb)
+
+        cat_l_labels_list = torch.cat(l_labels_list,0).data.cpu().numpy()
+        cat_r_labels_list = torch.cat(r_labels_list,0).data.cpu().numpy()
+        cat_l_probs_list = torch.cat(l_probs_list,0).data.cpu().numpy()
+        cat_r_probs_list = torch.cat(r_probs_list,0).data.cpu().numpy()
+        l_AUC = roc_auc_score(cat_l_labels_list,cat_l_probs_list,average="micro")
+        r_AUC = roc_auc_score(cat_r_labels_list,cat_r_probs_list,average="micro")
+        AUC = (l_AUC + r_AUC) / 2
+        AUC = l_AUC
+        acc = 100. * correct / total_ent
+        print("Test %s Accuracy is: %f AUC: %f" %(attribute,acc,AUC))
+        if args.do_log:
+            experiment.log_metric("Test "+attribute+" AUC",float(AUC),step=epoch)
+            experiment.log_metric("Test "+attribute+" Accuracy",float(acc),step=epoch)
+
+    def train_attr(args,modelD,train_dataset,test_dataset,\
+            attr_data,experiment,filter_set=None,attribute=None):
+        freeze_model(modelD)
+        if attribute == '0':
+            attr_data = [args.attr_mat,args.ent_to_idx,args.attr_to_idx,\
+                    args.reindex_attr_idx,args.attr_count]
+            net = FBDemParDisc(args.embed_dim,args.fair_att_0,'0',attr_data,
+                    use_cross_entropy=args.use_cross_entropy)
+            net.cuda()
+        elif attribute == '1':
+            attr_data = [args.attr_mat,args.ent_to_idx,args.attr_to_idx,\
+                    args.reindex_attr_idx,args.attr_count]
+            net = FBDemParDisc(args.embed_dim,args.fair_att_1,'1',attr_data,\
+                    use_cross_entropy=args.use_cross_entropy)
+            net.cuda()
+        elif attribute == '2':
+            attr_data = [args.attr_mat,args.ent_to_idx,args.attr_to_idx,\
+                    args.reindex_attr_idx,args.attr_count]
+            net = FBDemParDisc(args.embed_dim,args.fair_att_2,'2',attr_data,\
+                    use_cross_entropy=args.use_cross_entropy)
+            net.cuda()
+
+        modelD.eval()
+        opt = optimizer(net.parameters(),'adam', args.lr)
+        train_loader = DataLoader(train_dataset, num_workers=1,
+                batch_size=16000)
+        criterion = nn.BCELoss()
+
+        for epoch in range(1,args.num_classifier_epochs + 1):
+            correct = 0
+            if epoch % 10 == 0:
+                test_attr(args,test_dataset,modelD,net,experiment,epoch,attribute,filter_set)
+
+            for triplet in train_loader:
+                lhs, rel, rhs = triplet[:,0], triplet[:,1],triplet[:,2]
+                l_batch = Variable(lhs).cuda()
+                r_batch = Variable(rhs).cuda()
+                rel_batch = Variable(rel).cuda()
+                lhs_emb = modelD.get_embed(l_batch,rel_batch,filter_set)
+                # rhs_emb = modelD.get_embed(r_batch,rel_batch,filter_set)
+                opt.zero_grad()
+                l_y_hat, l_y = net(lhs_emb.detach(),lhs)
+                l_loss = criterion(l_y_hat, l_y)
+                # r_y_hat, r_y = net(rhs_emb.detach(),rhs)
+                # r_loss = criterion(r_y_hat, r_y)
+                loss = l_loss #+ r_loss
+                loss.backward()
+                opt.step()
+                preds = (l_y_hat > torch.Tensor([0.5]).cuda()).float() * 1
+                correct = preds.eq(l_y.view_as(preds)).sum().item()
+                acc = 100. * correct / len(lhs)
+                AUC = roc_auc_score(l_y.data.cpu().numpy(),\
+                        l_y_hat.data.cpu().numpy(),average="micro")
+                # f1 = f1_score(l_y.data.cpu().numpy(), preds.data.cpu().numpy(),\
+                        # average='binary')
+
+            print("Train %s Attrbitue Loss is %f Accuracy is: %f AUC: %f"\
+                    %(attribute,loss,acc,AUC))
+            if args.do_log:
+                experiment.log_metric("Train "+ attribute+"\
+                         AUC",float(AUC),step=epoch)
+
     def test_fairness(dataset,args,modelD,tflogger,fairD,attribute,\
             epoch,experiment,filter_=None):
-        test_loader = DataLoader(dataset, num_workers=1, batch_size=8192, collate_fn=collate_fn)
+        test_loader = DataLoader(dataset, num_workers=4, batch_size=8192, collate_fn=collate_fn)
         correct = 0
         total_ent = 0
         if args.show_tqdm:
@@ -803,7 +973,7 @@ def main(args):
 
         l_probs_list, r_probs_list = [], []
         l_labels_list, r_labels_list = [], []
-        for idx, triplet in data_itr:
+        for triplet in test_loader:
             lhs, rel, rhs = triplet[:,0], triplet[:,1],triplet[:,2]
             l_batch = Variable(lhs).cuda()
             r_batch = Variable(rhs).cuda()
@@ -835,41 +1005,8 @@ def main(args):
                     Accuracy',float(acc),epoch)
             experiment.log_metric("Test "+attribute+" AUC",float(AUC),step=epoch)
             experiment.log_metric("Test "+attribute+" Accuracy",float(acc),step=epoch)
-    # def test_fairness(dataset):
-        # test_loader = DataLoader(dataset, num_workers=1, batch_size=4096, collate_fn=collate_fn)
-        # correct = 0
-        # total_ent = 0
-        # precision_list = []
-        # recall_list = []
-        # fscore_list = []
-        # if args.show_tqdm:
-            # data_itr = tqdm(enumerate(test_loader))
-        # else:
-            # data_itr = enumerate(test_loader)
 
-        # for idx, triplet in data_itr:
-            # lhs, rel, rhs = triplet[:,0], triplet[:,1],triplet[:,2]
-            # l_batch = Variable(lhs).cuda()
-            # r_batch = Variable(rhs).cuda()
-            # rel_batch = Variable(rel).cuda()
-            # lhs_emb = modelD.get_embed(l_batch,rel_batch)
-            # rhs_emb = modelD.get_embed(r_batch,rel_batch)
-            # l_preds,l_A_labels = fairD.predict(lhs_emb,lhs,return_preds=True)
-            # r_preds, r_A_labels = fairD.predict(rhs_emb,rhs,return_preds=True)
-            # l_correct = l_preds.eq(l_A_labels.view_as(l_preds)).sum().item()
-            # r_correct = r_preds.eq(r_A_labels.view_as(r_preds)).sum().item()
-            # correct += l_correct + r_correct
-            # total_ent += len(lhs_emb) + len(rhs_emb)
-
-        # if args.do_log and args.use_attr: # Tensorboard logging
-            # acc = 100. * correct / total_ent
-            # mean_precision = np.mean(np.asarray(precision_list))
-            # mean_recall = np.mean(np.asarray(recall_list))
-            # mean_fscore = np.mean(np.asarray(fscore_list))
-            # tflogger.scalar_summary('Valid Fairness Discriminator,\
-                    # Accuracy',float(acc),epoch)
-
-    def test(dataset, subsample=1):
+    def test(dataset, args, all_hash, modelD, tflogger, filter_set, experiment, subsample=1):
         l_ranks, r_ranks = [], []
         test_loader = DataLoader(dataset, num_workers=1, collate_fn=collate_fn)
 
@@ -903,7 +1040,7 @@ def main(args):
             r_batch = Variable(r_batch)
 
             d_ins = torch.cat([l_batch, r_batch], dim=0)
-            d_outs = modelD(d_ins)
+            d_outs = modelD(d_ins,filters=filter_set)
             l_enrgs = d_outs[:len(l_batch)]
             r_enrgs = d_outs[len(l_batch):]
 
@@ -918,6 +1055,121 @@ def main(args):
 
         return l_ranks, r_ranks
 
+    def retrain_disc(args,train_loader,train_hash,test_set,modelD,optimizerD,tflogger,\
+            filter_0,filter_1,filter_2,attribute):
+
+        if args.use_trained_filters:
+            print("Retrain New Discriminator with Filter on %s" %(attribute))
+        else:
+            print("Retrain New Discriminator on %s" %(attribute))
+
+        ''' Reset some flags '''
+        args.use_cross_entropy = True
+        args.sample_mask = False
+        args.freeze_transD = True
+        new_fairD_0,new_fairD_1,new_fairD_2 = None,None,None
+        new_optimizer_fairD_0,new_optimizer_fairD_1,new_optimizer_fairD_2 = None,None,None
+
+        if attribute == '0':
+            args.use_0_attr = True
+            args.use_1_attr = False
+            args.use_2_attr = False
+            args.use_attr = False
+        elif attribute =='1':
+            args.use_0_attr = False
+            args.use_1_attr = True
+            args.use_2_attr = False
+            args.use_attr = False
+        elif attribute =='2':
+            args.use_0_attr = False
+            args.use_1_attr = False
+            args.use_2_attr = True
+            args.use_attr = False
+        else:
+            args.use_0_attr = False
+            args.use_1_attr = False
+            args.use_2_attr = False
+            args.use_attr = True
+
+        '''Retrain Discriminator on Frozen TransD Model '''
+        if args.use_1_attr:
+            attr_data = [args.attr_mat,args.ent_to_idx,args.attr_to_idx,\
+                    args.reindex_attr_idx,args.attr_count]
+            new_fairD_1 = FBDemParDisc(args.embed_dim,args.fair_att_1,'1',attr_data,
+                    use_cross_entropy=args.use_cross_entropy)
+            new_fairD_1.cuda()
+            new_optimizer_fairD_1 = optimizer(new_fairD_1.parameters(),'adam')
+            fairD_disc = new_fairD_1
+            fair_optim = new_optimizer_fairD_1
+        elif args.use_0_attr:
+            attr_data = [args.attr_mat,args.ent_to_idx,args.attr_to_idx,\
+                    args.reindex_attr_idx,args.attr_count]
+            new_fairD_0 = FBDemParDisc(args.embed_dim,args.fair_att_0,'0',attr_data,\
+                    use_cross_entropy=args.use_cross_entropy)
+            new_optimizer_fairD_0 = optimizer(new_fairD_0.parameters(),'adam')
+            new_fairD_0.cuda()
+            fairD_disc = new_fairD_0
+            fair_optim = new_optimizer_fairD_0
+        elif args.use_2_attr:
+            attr_data = [args.attr_mat,args.ent_to_idx,args.attr_to_idx,\
+                    args.reindex_attr_idx,args.attr_count]
+            new_fairD_2 = FBDemParDisc(args.embed_dim,args.fair_att_2,'2',attr_data,\
+                    use_cross_entropy=args.use_cross_entropy)
+            new_optimizer_fairD_2 = optimizer(new_fairD_2.parameters(),'adam')
+            new_fairD_2.cuda()
+            fairD_disc = new_fairD_2
+            fair_optim = new_optimizer_fairD_2
+
+        attr_data = [args.attr_mat,args.ent_to_idx,args.attr_to_idx,\
+                args.reindex_attr_idx,args.attr_count]
+        new_fairD_set = [new_fairD_0,new_fairD_1,new_fairD_2]
+        new_optimizer_fairD_set = [new_optimizer_fairD_0,new_optimizer_fairD_1,new_optimizer_fairD_2]
+        if args.use_trained_filters:
+            filter_set = [filter_0,filter_1,filter_2]
+        else:
+            filter_set = [None,None,None]
+
+        ''' Freeze Model + Filters '''
+        for filter_ in filter_set:
+            if filter_ is not None:
+                freeze_model(filter_)
+        freeze_model(modelD)
+
+        for epoch in tqdm(range(1, args.num_epochs + 1)):
+            train(train_loader,epoch,args,train_hash,modelD,optimizerD,\
+                    tflogger,new_fairD_set,new_optimizer_fairD_set,filter_set,experiment)
+            gc.collect()
+            if args.decay_lr:
+                if args.decay_lr == 'ReduceLROnPlateau':
+                    schedulerD.step(monitor['D_loss_epoch_avg'])
+                else:
+                    pass
+                    # schedulerD.step()
+
+            if epoch % args.valid_freq == 0:
+                if args.use_attr:
+                    test_fairness(test_set,args, modelD,tflogger,\
+                            new_fairD_0,attribute='0',\
+                            epoch=epoch,experiment=experiment,filter_=filter_0)
+                    test_fairness(test_set,args,modelD,tflogger,\
+                            new_fairD_1,attribute='1',epoch=epoch,\
+                            experiment=experiment,filter_=filter_1)
+                    test_fairness(test_set,args, modelD,tflogger,\
+                            new_fairD_2,attribute='2',epoch=epoch,\
+                            experiment=experiment,filter_=filter_2)
+                elif args.use_0_attr:
+                    test_fairness(test_set,args,modelD,tflogger,\
+                            new_fairD_0,attribute='0',epoch=epoch,\
+                            experiment=experiment,filter_=filter_0)
+                elif args.use_1_attr:
+                    test_fairness(test_set,args,modelD,tflogger,\
+                            new_fairD_1,attribute='1',epoch=epoch,\
+                            experiment=experiment,filter_=filter_1)
+                elif args.use_2_attr:
+                    test_fairness(test_set,args,modelD,tflogger,\
+                            new_fairD_2,attribute='2',epoch=epoch,\
+                            experiment=experiment,filter_=filter_2)
+
     if args.prefetch_to_gpu:
         train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, drop_last=True,
                                   num_workers=0, collate_fn=collate_fn)
@@ -928,80 +1180,106 @@ def main(args):
     if args.freeze_transD:
         freeze_model(modelD)
 
-    for epoch in tqdm(range(1, args.num_epochs + 1)):
-        train(train_loader,epoch,args,train_hash,modelD,optimizerD,\
-                tflogger,fairD_set,optimizer_fairD_set,filter_set,experiment)
-        # train(train_loader,epoch)
-        gc.collect()
-        if args.decay_lr:
-            if args.decay_lr == 'ReduceLROnPlateau':
-                schedulerD.step(monitor['D_loss_epoch_avg'])
-            else:
-                schedulerD.step()
-                # scheduler_fairD.step()
+    with experiment.train():
+        for epoch in tqdm(range(1, args.num_epochs + 1)):
+            train(train_loader,epoch,args,train_hash,modelD,optimizerD,\
+                    tflogger,fairD_set,optimizer_fairD_set,filter_set,experiment)
+            gc.collect()
+            if args.decay_lr:
+                if args.decay_lr == 'ReduceLROnPlateau':
+                    schedulerD.step(monitor['D_loss_epoch_avg'])
+                else:
+                    schedulerD.step()
+                    # scheduler_fairD.step()
 
-        if epoch % args.valid_freq == 0:
-            with torch.no_grad():
-                l_ranks, r_ranks = test(valid_set, subsample=10)
-                l_mean = l_ranks.mean()
-                r_mean = r_ranks.mean()
-                l_mrr = (1. / l_ranks).mean()
-                r_mrr = (1. / r_ranks).mean()
-                l_h10 = (l_ranks <= 10).mean()
-                r_h10 = (r_ranks <= 10).mean()
-                l_h5 = (l_ranks <= 5).mean()
-                r_h5 = (r_ranks <= 5).mean()
-                avg_mr = (l_mean + r_mean)/2
-                avg_mrr = (l_mrr+r_mrr)/2
-                avg_h10 = (l_h10+r_h10)/2
-                avg_h5 = (l_h5+r_h5)/2
+            if epoch % args.valid_freq == 0:
+                with torch.no_grad():
+                    l_ranks, r_ranks = test(valid_set,args,all_hash,\
+                            modelD,tflogger,filter_set,experiment,subsample=20)
+                    l_mean = l_ranks.mean()
+                    r_mean = r_ranks.mean()
+                    l_mrr = (1. / l_ranks).mean()
+                    r_mrr = (1. / r_ranks).mean()
+                    l_h10 = (l_ranks <= 10).mean()
+                    r_h10 = (r_ranks <= 10).mean()
+                    l_h5 = (l_ranks <= 5).mean()
+                    r_h5 = (r_ranks <= 5).mean()
+                    avg_mr = (l_mean + r_mean)/2
+                    avg_mrr = (l_mrr+r_mrr)/2
+                    avg_h10 = (l_h10+r_h10)/2
+                    avg_h5 = (l_h5+r_h5)/2
 
-            print("Mean Rank is %f" %(float(avg_mr)))
+                print("Mean Rank is %f" %(float(avg_mr)))
+                if args.use_attr:
+                    test_fairness(test_set,args, modelD,tflogger,\
+                            fairD_0,attribute='0',\
+                            epoch=epoch,experiment=experiment,filter_=filter_0)
+                    test_fairness(test_set,args,modelD,tflogger,\
+                            fairD_1,attribute='1',epoch=epoch,\
+                            experiment=experiment,filter_=filter_1)
+                    test_fairness(test_set,args, modelD,tflogger,\
+                            fairD_2,attribute='2',epoch=epoch,\
+                            experiment=experiment,filter_=filter_2)
+                elif args.use_0_attr:
+                    test_fairness(test_set,args,modelD,tflogger,\
+                            fairD_0,attribute='0',epoch=epoch,\
+                            experiment=experiment,filter_=filter_0)
+                elif args.use_1_attr:
+                    test_fairness(test_set,args,modelD,tflogger,\
+                            fairD_1,attribute='1',epoch=epoch,\
+                            experiment=experiment,filter_=filter_1)
+                elif args.use_2_attr:
+                    test_fairness(test_set,args,modelD,tflogger,\
+                            fairD_2,attribute='2',epoch=epoch,\
+                            experiment=experiment,filter_=filter_2)
+
+                if args.do_log: # Tensorboard logging
+                    tflogger.scalar_summary('Mean Rank',float(avg_mr),epoch)
+                    tflogger.scalar_summary('Mean Reciprocal Rank',float(avg_mrr),epoch)
+                    tflogger.scalar_summary('Hit @10',float(avg_h10),epoch)
+                    tflogger.scalar_summary('Hit @5',float(avg_h5),epoch)
+                    experiment.log_metric("Mean Rank",float(avg_mr),step=epoch)
+
+                modelD.save(args.outname_base+'D_epoch{}.pts'.format(epoch))
+
+        l_ranks, r_ranks = test(test_set,args,all_hash,\
+                modelD,tflogger,filter_set,experiment,subsample=1)
+        l_mean = l_ranks.mean()
+        r_mean = r_ranks.mean()
+        l_mrr = (1. / l_ranks).mean()
+        r_mrr = (1. / r_ranks).mean()
+        l_h10 = (l_ranks <= 10).mean()
+        r_h10 = (r_ranks <= 10).mean()
+        l_h5 = (l_ranks <= 5).mean()
+        r_h5 = (r_ranks <= 5).mean()
+        avg_mr = (l_mean + r_mean)/2
+        avg_mrr = (l_mrr+r_mrr)/2
+        print("Mean Rank is %f" %(float(avg_mr)))
+        if args.do_log: # Tensorboard logging
+            experiment.log_metric("Mean Rank",float(avg_mr),step=args.num_epochs + 2)
+
+    if args.test_new_disc:
+        ''' Testing with fresh discriminators '''
+        args.use_attr = True
+        attr_data = [args.attr_mat,args.ent_to_idx,args.attr_to_idx,\
+                args.reindex_attr_idx,args.attr_count]
+        with experiment.test():
+            logdir_filter = args.outname_base + '_test_2_filter_logs' + '/'
+            if args.remove_old_run:
+                shutil.rmtree(logdir_filter)
+            if not os.path.exists(logdir_filter):
+                os.makedirs(logdir_filter)
+            tflogger_filter = tfLogger(logdir_filter)
+
+            args.use_trained_filters = True
+            ''' Test With Filters '''
             if args.use_attr:
-                test_fairness(test_set,args, modelD,tflogger,\
-                        new_fairD_0,attribute='0',\
-                        epoch=epoch,experiment=experiment,filter_=filter_0)
-                test_fairness(test_set,args,modelD,tflogger,\
-                        new_fairD_1,attribute='1',epoch=epoch,\
-                        experiment=experiment,filter_=filter_1)
-                test_fairness(test_set,args, modelD,tflogger,\
-                        new_fairD_2,attribute='2',epoch=epoch,\
-                        experiment=experiment,filter_=filter_2)
-            elif args.use_0_attr:
-                test_fairness(test_set,args,modelD,tflogger,\
-                        new_fairD_0,attribute='0',epoch=epoch,\
-                        experiment=experiment,filter_=filter_0)
-            elif args.use_1_attr:
-                test_fairness(test_set,args,modelD,tflogger,\
-                        new_fairD_1,attribute='1',epoch=epoch,\
-                        experiment=experiment,filter_=filter_1)
-            elif args.use_2_attr:
-                test_fairness(test_set,args,modelD,tflogger,\
-                        new_fairD_2,attribute='2',epoch=epoch,\
-                        experiment=experiment,filter_=filter_2)
-            # test_fairness(valid_set)
-
-            joblib.dump({'l_ranks':l_ranks, 'r_ranks':r_ranks}, args.outname_base+'epoch{}_validation_ranks.pkl'.format(epoch), compress=9)
-            if args.do_log: # Tensorboard logging
-                tflogger.scalar_summary('Mean Rank',float(avg_mr),epoch)
-                tflogger.scalar_summary('Mean Reciprocal Rank',float(avg_mrr),epoch)
-                tflogger.scalar_summary('Hit @10',float(avg_h10),epoch)
-                tflogger.scalar_summary('Hit @5',float(avg_h5),epoch)
-
-            modelD.save(args.outname_base+'D_epoch{}.pts'.format(epoch))
-
-    l_ranks, r_ranks = test(test_set)
-    l_mean = l_ranks.mean()
-    r_mean = r_ranks.mean()
-    l_mrr = (1. / l_ranks).mean()
-    r_mrr = (1. / r_ranks).mean()
-    l_h10 = (l_ranks <= 10).mean()
-    r_h10 = (r_ranks <= 10).mean()
-    l_h5 = (l_ranks <= 5).mean()
-    r_h5 = (r_ranks <= 5).mean()
-
-    modelD.save(args.outname_base+'D_final.pts')
-    joblib.dump({'l_ranks':l_ranks, 'r_ranks':r_ranks}, args.outname_base+'test_ranks.pkl', compress=9)
+                train_attr(args,modelD,train_set,test_set,\
+                        attr_data,experiment,filter_set=None,attribute='2')
+                train_attr(args,modelD,train_set,test_set,\
+                        attr_data,experiment,filter_set=None,attribute='1')
+                train_attr(args,modelD,train_set,test_set,\
+                        attr_data,experiment,filter_set=None,attribute='0')
 
 if __name__ == '__main__':
     main(parse_args())
