@@ -48,9 +48,9 @@ V2 Gamma=1' --valid_freq=5 --num_sensitive=10 --use_attr=True
 
 If you use this codebase or ideas in the paper please cite:
 
-`@article{bose2019compositional,
-  title={Compositional Fairness Constraints for Graph Embeddings},
-  author={Bose, Avishek Joey and Hamilton, William},
-  conference={Proceedings of the Thirty-sixth International Conference on Machine Learning, Long Beach CA},
-  year={2019}
+`@article{bose2019compositional, \\
+  title={Compositional Fairness Constraints for Graph Embeddings},\\
+  author={Bose, Avishek Joey and Hamilton, William},\\
+  conference={Proceedings of the Thirty-sixth International Conference on Machine Learning, Long Beach CA},\\
+  year={2019} \\
 }`
