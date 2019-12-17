@@ -27,59 +27,13 @@ from collections import Counter, OrderedDict
 import ipdb
 sys.path.append('../')
 import gc
-from model_copy import *
+from model import *
 
 # ftensor = torch.FloatTensor
 ltensor = torch.LongTensor
 
 v2np = lambda v: v.data.cpu().numpy()
 USE_SPARSE_EMB = True
-
-class KBDataset(Dataset):
-    def __init__(self,data_split,prefetch_to_gpu=False):
-        self.prefetch_to_gpu = prefetch_to_gpu
-        self.dataset = np.ascontiguousarray(data_split)
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        return self.dataset[idx]
-
-    def shuffle(self):
-        if self.dataset.is_cuda:
-            self.dataset = self.dataset.cpu()
-
-        data = self.dataset
-        np.random.shuffle(data)
-        data = np.ascontiguousarray(data)
-        self.dataset = ltensor(data)
-
-        if self.prefetch_to_gpu:
-            self.dataset = self.dataset.cuda().contiguous()
-
-class NodeClassification(Dataset):
-    def __init__(self,data_split,prefetch_to_gpu=False):
-        self.prefetch_to_gpu = prefetch_to_gpu
-        self.dataset = np.ascontiguousarray(data_split)
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        return self.dataset[idx]
-
-    def shuffle(self):
-        if self.dataset.is_cuda:
-            self.dataset = self.dataset.cpu()
-
-        data = self.dataset
-        np.random.shuffle(data)
-        data = np.ascontiguousarray(data)
-        self.dataset = ltensor(data)
-
-        if self.prefetch_to_gpu:
-            self.dataset = self.dataset.cuda().contiguous()
 
 def parse_args():
     parser = argparse.ArgumentParser()
