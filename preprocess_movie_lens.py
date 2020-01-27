@@ -27,7 +27,7 @@ def make_dataset(load_sidechannel=False):
             columns=['user_id'],values='rating').reset_index(drop=True)
     train_ratings_matrix.fillna( 0, inplace = True )
     test_ratings.drop( "unix_timestamp", inplace = True, axis = 1 )
-    test_ratings_matrix = train_ratings.pivot_table(index=['movie_id'],\
+    test_ratings_matrix = test_ratings.pivot_table(index=['movie_id'],\
             columns=['user_id'],values='rating').reset_index(drop=True)
     test_ratings_matrix.fillna( 0, inplace = True )
     train_ratings_matrix.head()

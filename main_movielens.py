@@ -94,8 +94,8 @@ def parse_args():
     ''' Offset Movie ID's by # users because in TransD they share the same
     embedding Layer '''
 
-    args.train_ratings['movie_id'] += int(np.max(args.users['user_id']))
-    args.test_ratings['movie_id'] += int(np.max(args.users['user_id']))
+    args.train_ratings['movie_id'] += int(np.max(args.users['user_id'])) + 1
+    args.test_ratings['movie_id'] += int(np.max(args.users['user_id'])) + 1
 
     if args.use_random_attr:
         rand_attr = np.random.choice(2, len(args.users))
