@@ -555,7 +555,7 @@ def main(args):
         train_set = KBDataset(args.data_path % 'train', args.prefetch_to_gpu)
         valid_set = KBDataset(args.data_path % 'valid')
         test_set = KBDataset(args.data_path % 'test')
-        print('50 Most Commone Attributes')
+        print('50 Most Common Attributes')
 
     if args.prefetch_to_gpu:
         train_hash = set([r.tobytes() for r in train_set.dataset.cpu().numpy()])
